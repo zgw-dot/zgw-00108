@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 import pytest
 
 from repair_cli.models import (
+    ApprovalPolicy,
     MaintenanceWindow,
     RepairTask,
     Role,
@@ -313,3 +314,214 @@ def test_failed_rollback_writes_audit_log(service, approved_task):
     assert failed_audit.old_status == initial_status.value
     assert failed_audit.new_status == initial_status.value
     assert "must be 'succeeded' or 'failed'" in (failed_audit.details or "")
+
+
+def test_get_policy_default(service):
+    """Test get_policy returns default policy."""
+    policy = service.get_policy()
+    assert isinstance(policy, ApprovalPolicy)
+    assert policy.allow_admin_self_approval is True
+    assert policy.require_different_approver is True
+
+
+def test_update_policy_requires_admin(service):
+    """Test that only admin can update policy."""
+    with pytest.raises(ValidationError) as exc_info:
+        service.update_policy(
+            actor="operator_user",
+            allow_admin_self_approval=False,
+        )
+    assert exc_info.value.code == "policy_update_denied"
+
+    audits = service.audit_repo.list()
+    denied_audits = [a for a in audits if a.action == "policy_update_denied"]
+    assert len(denied_audits) >= 1
+    assert denied_audits[-1].actor == "operator_user"
+
+
+def test_update_policy_success_and_audit(service):
+    """Test successful policy update and audit logging."""
+    initial_audits = service.audit_repo.list()
+
+    result = service.update_policy(
+        actor="admin_user",
+        allow_admin_self_approval=False,
+        require_different_approver=True,
+    )
+
+    assert result.old_policy.allow_admin_self_approval is True
+    assert result.new_policy.allow_admin_self_approval is False
+    assert "allow_admin_self_approval" in result.changed_fields
+    assert "require_different_approver" not in result.changed_fields
+
+    audits = service.audit_repo.list()
+    assert len(audits) > len(initial_audits)
+    policy_audits = [a for a in audits if a.action == "policy_updated"]
+    assert len(policy_audits) == 1
+    assert policy_audits[0].actor == "admin_user"
+    assert "allow_admin_self_approval=True" in (policy_audits[0].details or "")
+    assert "allow_admin_self_approval=False" in (policy_audits[0].details or "")
+
+
+def test_policy_disable_admin_self_approval(service, active_window, role_repo):
+    """Test that disabling admin self-approval blocks admin from approving own tasks."""
+    role_repo.set_role("admin_creator", Role.ADMIN)
+
+    service.update_policy(
+        actor="admin_user",
+        allow_admin_self_approval=False,
+    )
+
+    task = service.create_task(RepairTask(
+        name="admin-blocked-self-approve",
+        description="Test admin self-approval blocked by policy",
+        created_by="admin_creator",
+        sql="UPDATE ...",
+        rollback_sql="UPDATE ...",
+        window_id=active_window.id,
+    ))
+    task = service.submit_for_approval(task.id, "admin_creator")
+
+    with pytest.raises(ValidationError) as exc_info:
+        service.approve_task(task.id, "admin_creator")
+    assert exc_info.value.code == "self_approval_not_allowed"
+
+    refreshed = service.task_repo.get(task.id)
+    assert refreshed.status == TaskStatus.PENDING_APPROVAL
+
+
+def test_policy_enable_admin_self_approval(service, active_window, role_repo):
+    """Test that enabling admin self-approval allows admin to approve own tasks (default)."""
+    role_repo.set_role("admin_creator", Role.ADMIN)
+
+    service.update_policy(
+        actor="admin_user",
+        allow_admin_self_approval=True,
+    )
+
+    task = service.create_task(RepairTask(
+        name="admin-allowed-self-approve",
+        description="Test admin self-approval allowed by policy",
+        created_by="admin_creator",
+        sql="UPDATE ...",
+        rollback_sql="UPDATE ...",
+        window_id=active_window.id,
+    ))
+    task = service.submit_for_approval(task.id, "admin_creator")
+
+    approved = service.approve_task(task.id, "admin_creator")
+    assert approved.status == TaskStatus.APPROVED
+    assert approved.approved_by == "admin_creator"
+
+
+def test_policy_disable_require_different_approver(service, active_window, role_repo):
+    """Test that disabling require_different_approver allows regular users to approve own tasks."""
+    role_repo.set_role("approver_creator", Role.APPROVER)
+
+    service.update_policy(
+        actor="admin_user",
+        require_different_approver=False,
+    )
+
+    task = service.create_task(RepairTask(
+        name="self-approve-allowed",
+        description="Test self-approval allowed when policy disabled",
+        created_by="approver_creator",
+        sql="UPDATE ...",
+        rollback_sql="UPDATE ...",
+        window_id=active_window.id,
+    ))
+    task = service.submit_for_approval(task.id, "approver_creator")
+
+    approved = service.approve_task(task.id, "approver_creator")
+    assert approved.status == TaskStatus.APPROVED
+    assert approved.approved_by == "approver_creator"
+
+
+def test_policy_disable_require_different_approver_reject(service, active_window, role_repo):
+    """Test that disabling require_different_approver allows users to reject own tasks."""
+    role_repo.set_role("approver_creator", Role.APPROVER)
+
+    service.update_policy(
+        actor="admin_user",
+        require_different_approver=False,
+    )
+
+    task = service.create_task(RepairTask(
+        name="self-reject-allowed",
+        description="Test self-rejection allowed when policy disabled",
+        created_by="approver_creator",
+        sql="UPDATE ...",
+        rollback_sql="UPDATE ...",
+        window_id=active_window.id,
+    ))
+    task = service.submit_for_approval(task.id, "approver_creator")
+
+    rejected = service.reject_task(task.id, "approver_creator", reason="Changed my mind")
+    assert rejected.status == TaskStatus.REJECTED
+
+
+def test_policy_change_audited_properly(service):
+    """Test that policy changes are properly audited with before/after values."""
+    service.update_policy(
+        actor="admin_user",
+        allow_admin_self_approval=False,
+        require_different_approver=False,
+    )
+
+    audits = service.audit_repo.list()
+    policy_audit = [a for a in audits if a.action == "policy_updated"][-1]
+
+    assert "allow_admin_self_approval=True" in (policy_audit.details or "")
+    assert "allow_admin_self_approval=False" in (policy_audit.details or "")
+    assert "require_different_approver=True" in (policy_audit.details or "")
+    assert "require_different_approver=False" in (policy_audit.details or "")
+    assert "Changed fields: allow_admin_self_approval, require_different_approver" in (policy_audit.details or "")
+
+
+def test_policy_update_no_changes(service):
+    """Test updating policy with same values returns empty changed_fields."""
+    result = service.update_policy(
+        actor="admin_user",
+        allow_admin_self_approval=True,
+        require_different_approver=True,
+    )
+    assert len(result.changed_fields) == 0
+
+    audits = service.audit_repo.list()
+    policy_audits = [a for a in audits if a.action == "policy_updated"]
+    assert len(policy_audits) >= 1
+    assert "Changed fields: none" in (policy_audits[-1].details or "")
+
+
+def test_policy_persistence_across_service_reconnect(service, db_path, active_window, role_repo):
+    """Test that policy persists across service reconnections and affects approval."""
+    from repair_cli.persistence import Database
+
+    role_repo.set_role("admin_creator", Role.ADMIN)
+
+    service.update_policy(
+        actor="admin_user",
+        allow_admin_self_approval=False,
+        require_different_approver=True,
+    )
+
+    task = service.create_task(RepairTask(
+        name="persistence-test-task",
+        description="Test policy persistence",
+        created_by="admin_creator",
+        sql="UPDATE ...",
+        window_id=active_window.id,
+    ))
+    task = service.submit_for_approval(task.id, "admin_creator")
+
+    new_db = Database(f"sqlite:///{db_path}")
+    new_db.init_db()
+    new_db.init_default_policy()
+    new_service = RepairService(new_db)
+
+    policy = new_service.get_policy()
+    assert policy.allow_admin_self_approval is False
+
+    with pytest.raises(ValidationError, match="cannot approve their own task"):
+        new_service.approve_task(task.id, "admin_creator")

@@ -32,6 +32,7 @@ def temp_db() -> Generator[Tuple[Database, str], None, None]:
     db = Database(db_url)
     db.init_db()
     db.init_default_roles()
+    db.init_default_policy()
     try:
         yield db, db_path
     finally:

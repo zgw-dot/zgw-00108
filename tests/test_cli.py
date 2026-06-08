@@ -671,3 +671,218 @@ def test_cli_failed_rollback_audit_log(runner: CliRunner, db_path):
     assert failed_audit["old_status"] == initial_status
     assert failed_audit["new_status"] == initial_status
     assert "must be 'succeeded' or 'failed'" in (failed_audit["details"] or "")
+
+
+def test_cli_policy_view_default(runner: CliRunner, db_path):
+    """Test viewing default policy via CLI."""
+    result = runner.invoke(cli, [
+        "--db", db_path,
+        "--format", "json",
+        "policy", "view",
+    ])
+    assert result.exit_code == 0, result.output
+    policy = json.loads(result.output)
+    assert policy["allow_admin_self_approval"] is True
+    assert policy["require_different_approver"] is True
+
+
+def test_cli_policy_view_table_format(runner: CliRunner, db_path):
+    """Test viewing policy in table format."""
+    result = runner.invoke(cli, [
+        "--db", db_path,
+        "--format", "table",
+        "policy", "view",
+    ])
+    assert result.exit_code == 0, result.output
+    assert "Allow Admin Self-Approval" in result.output
+    assert "Require Different Approver" in result.output
+
+
+def test_cli_policy_set_admin_only(runner: CliRunner, db_path):
+    """Test that only admin can set policy via CLI."""
+    result = runner.invoke(cli, [
+        "--db", db_path,
+        "--format", "json",
+        "policy", "set",
+        "--allow-admin-self-approval", "false",
+        "--as-user", "operator_user",
+    ])
+    assert result.exit_code != 0
+    error = json.loads(result.output)
+    assert error["success"] is False
+    assert error["code"] == "policy_update_denied"
+
+
+def test_cli_policy_set_success(runner: CliRunner, db_path):
+    """Test successful policy update via CLI."""
+    result = runner.invoke(cli, [
+        "--db", db_path,
+        "--format", "json",
+        "policy", "set",
+        "--allow-admin-self-approval", "false",
+        "--require-different-approver", "false",
+        "--as-user", "admin_user",
+    ])
+    assert result.exit_code == 0, result.output
+    response = json.loads(result.output)
+    assert response["success"] is True
+    assert "allow_admin_self_approval" in response["changed_fields"]
+    assert "require_different_approver" in response["changed_fields"]
+    assert response["new_policy"]["allow_admin_self_approval"] is False
+    assert response["new_policy"]["require_different_approver"] is False
+
+    result = runner.invoke(cli, [
+        "--db", db_path,
+        "--format", "json",
+        "policy", "view",
+    ])
+    policy = json.loads(result.output)
+    assert policy["allow_admin_self_approval"] is False
+    assert policy["require_different_approver"] is False
+
+
+def test_cli_policy_set_partial(runner: CliRunner, db_path):
+    """Test partial policy update via CLI."""
+    result = runner.invoke(cli, [
+        "--db", db_path,
+        "--format", "json",
+        "policy", "set",
+        "--allow-admin-self-approval", "false",
+        "--as-user", "admin_user",
+    ])
+    assert result.exit_code == 0, result.output
+    response = json.loads(result.output)
+    assert "allow_admin_self_approval" in response["changed_fields"]
+    assert "require_different_approver" not in response["changed_fields"]
+
+    result = runner.invoke(cli, [
+        "--db", db_path,
+        "--format", "json",
+        "policy", "view",
+    ])
+    policy = json.loads(result.output)
+    assert policy["allow_admin_self_approval"] is False
+    assert policy["require_different_approver"] is True
+
+
+def test_cli_policy_set_missing_option(runner: CliRunner, db_path):
+    """Test policy set with no options returns error."""
+    result = runner.invoke(cli, [
+        "--db", db_path,
+        "--format", "json",
+        "policy", "set",
+        "--as-user", "admin_user",
+    ])
+    assert result.exit_code != 0
+    error = json.loads(result.output)
+    assert error["success"] is False
+    assert error["code"] == "missing_policy_option"
+
+
+def test_cli_policy_change_affects_approval(runner: CliRunner, db_path):
+    """Test that policy change via CLI affects actual approval behavior."""
+    start = (datetime.utcnow() - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+    end = (datetime.utcnow() + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S")
+
+    runner.invoke(cli, [
+        "--db", db_path,
+        "window", "create",
+        "--name", "policy-approval-test-win",
+        "--start", start,
+        "--end", end,
+        "--as-user", "admin_user",
+    ])
+
+    result = runner.invoke(cli, [
+        "--db", db_path,
+        "--format", "json",
+        "window", "list",
+    ])
+    windows = json.loads(result.output)
+    window_id = windows[0]["id"]
+
+    result = runner.invoke(cli, [
+        "--db", db_path,
+        "task", "create",
+        "--name", "policy-approval-test-task",
+        "--description", "test",
+        "--sql", "UPDATE ...",
+        "--rollback-sql", "UPDATE ...",
+        "--window-id", str(window_id),
+        "--as-user", "admin_user",
+    ])
+    assert result.exit_code == 0, result.output
+
+    result = runner.invoke(cli, [
+        "--db", db_path,
+        "--format", "json",
+        "task", "list",
+    ])
+    tasks = json.loads(result.output)
+    task_id = tasks[0]["id"]
+
+    runner.invoke(cli, [
+        "--db", db_path,
+        "task", "submit", str(task_id),
+        "--as-user", "admin_user",
+    ])
+
+    runner.invoke(cli, [
+        "--db", db_path,
+        "policy", "set",
+        "--allow-admin-self-approval", "false",
+        "--as-user", "admin_user",
+    ])
+
+    result = runner.invoke(cli, [
+        "--db", db_path,
+        "--format", "json",
+        "task", "approve", str(task_id),
+        "--as-user", "admin_user",
+    ])
+    assert result.exit_code != 0
+    error = json.loads(result.output)
+    assert error["success"] is False
+    assert "cannot approve their own task" in error["error"]
+
+
+def test_cli_policy_update_audit_log(runner: CliRunner, db_path):
+    """Test that policy updates are visible in audit log."""
+    runner.invoke(cli, [
+        "--db", db_path,
+        "policy", "set",
+        "--allow-admin-self-approval", "false",
+        "--as-user", "admin_user",
+    ])
+
+    result = runner.invoke(cli, [
+        "--db", db_path,
+        "--format", "json",
+        "audit", "list",
+    ])
+    assert result.exit_code == 0
+    audits = json.loads(result.output)
+    policy_audits = [a for a in audits if a["action"] == "policy_updated"]
+    assert len(policy_audits) >= 1
+    assert policy_audits[0]["actor"] == "admin_user"
+
+
+def test_cli_policy_update_denied_audit_log(runner: CliRunner, db_path):
+    """Test that denied policy updates are visible in audit log."""
+    runner.invoke(cli, [
+        "--db", db_path,
+        "policy", "set",
+        "--allow-admin-self-approval", "false",
+        "--as-user", "operator_user",
+    ])
+
+    result = runner.invoke(cli, [
+        "--db", db_path,
+        "--format", "json",
+        "audit", "list",
+    ])
+    assert result.exit_code == 0
+    audits = json.loads(result.output)
+    denied_audits = [a for a in audits if a["action"] == "policy_update_denied"]
+    assert len(denied_audits) >= 1
+    assert denied_audits[0]["actor"] == "operator_user"

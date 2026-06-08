@@ -11,9 +11,10 @@ from repair_cli.export_import import ExportImportService
 from repair_cli.models import (
     MaintenanceWindow,
     RepairTask,
+    Role,
     TaskStatus,
 )
-from repair_cli.persistence import Database
+from repair_cli.persistence import Database, PolicyRepository
 from repair_cli.validation import ValidationError
 
 
@@ -287,6 +288,260 @@ def test_import_preserves_audit_logs(service, export_service, active_window, suc
         original_actions = [a.action for a in original_audits]
         imported_actions = [a.action for a in imported_audits]
         assert imported_actions == original_actions
+    finally:
+        try:
+            os.unlink(new_db_path)
+        except OSError:
+            pass
+
+
+def test_export_plan_includes_policy(export_service, service):
+    """Test that exported plan includes policy information."""
+    service.update_policy(
+        actor="admin_user",
+        allow_admin_self_approval=False,
+        require_different_approver=False,
+    )
+
+    plan = export_service.export_plan()
+    assert "policy" in plan
+    assert plan["policy"]["allow_admin_self_approval"] is False
+    assert plan["policy"]["require_different_approver"] is False
+    assert plan["policy"]["updated_by"] == "admin_user"
+
+
+def test_import_policy_to_new_database(export_service, service, future_window, pending_task):
+    """Test that policy is imported to a new database."""
+    service.update_policy(
+        actor="admin_user",
+        allow_admin_self_approval=False,
+        require_different_approver=False,
+    )
+
+    plan = export_service.export_plan()
+
+    fd, new_db_path = tempfile.mkstemp(suffix=".sqlite")
+    os.close(fd)
+    try:
+        new_db = Database(f"sqlite:///{new_db_path}")
+        new_db.init_db()
+        new_db.init_default_roles()
+        new_db.init_default_policy()
+        new_export = ExportImportService(new_db)
+        new_policy_repo = PolicyRepository(new_db)
+
+        policy_before = new_policy_repo.get()
+        assert policy_before.allow_admin_self_approval is True
+
+        result = new_export.import_plan(plan, actor="importer")
+        assert result["policy_imported"] is True
+
+        policy_after = new_policy_repo.get()
+        assert policy_after.allow_admin_self_approval is False
+        assert policy_after.require_different_approver is False
+        assert policy_after.updated_by == "importer"
+    finally:
+        try:
+            os.unlink(new_db_path)
+        except OSError:
+            pass
+
+
+def test_import_policy_conflict_detected(export_service, service):
+    """Test that policy conflict is detected during import validation."""
+    service.update_policy(
+        actor="admin_user",
+        allow_admin_self_approval=False,
+        require_different_approver=True,
+    )
+
+    plan = export_service.export_plan()
+
+    fd, new_db_path = tempfile.mkstemp(suffix=".sqlite")
+    os.close(fd)
+    try:
+        new_db = Database(f"sqlite:///{new_db_path}")
+        new_db.init_db()
+        new_db.init_default_roles()
+        new_db.init_default_policy()
+        new_export = ExportImportService(new_db)
+        new_policy_repo = PolicyRepository(new_db)
+
+        new_policy_repo.update(
+            allow_admin_self_approval=True,
+            require_different_approver=False,
+            updated_by="existing_admin",
+        )
+
+        errors = new_export.validate_import_plan(plan)
+        policy_conflicts = [e for e in errors if e.code == "policy_conflict"]
+        assert len(policy_conflicts) == 1
+        assert "allow_admin_self_approval: local=True, imported=False" in policy_conflicts[0].message
+        assert "require_different_approver: local=False, imported=True" in policy_conflicts[0].message
+    finally:
+        try:
+            os.unlink(new_db_path)
+        except OSError:
+            pass
+
+
+def test_import_policy_dry_run_does_not_modify(export_service, service):
+    """Test that dry run import does not modify local policy."""
+    from click.testing import CliRunner
+    from repair_cli.cli import cli
+
+    service.update_policy(
+        actor="admin_user",
+        allow_admin_self_approval=False,
+        require_different_approver=False,
+    )
+
+    fd, export_path = tempfile.mkstemp(suffix=".json")
+    os.close(fd)
+    try:
+        export_service.export_to_file(export_path)
+
+        fd, new_db_path = tempfile.mkstemp(suffix=".sqlite")
+        os.close(fd)
+        try:
+            runner = CliRunner()
+
+            result = runner.invoke(cli, [
+                "--db", new_db_path,
+                "--format", "json",
+                "plan", "import", export_path,
+                "--dry-run",
+                "--as-user", "importer",
+            ])
+            assert result.exit_code == 0, result.output
+
+            new_db = Database(f"sqlite:///{new_db_path}")
+            new_db.init_db()
+            new_db.init_default_policy()
+            new_policy_repo = PolicyRepository(new_db)
+
+            policy = new_policy_repo.get()
+            assert policy.allow_admin_self_approval is True
+            assert policy.require_different_approver is True
+        finally:
+            try:
+                os.unlink(new_db_path)
+            except OSError:
+                pass
+    finally:
+        try:
+            os.unlink(export_path)
+        except OSError:
+            pass
+
+
+def test_import_policy_with_ignore_conflict_flag(export_service, service):
+    """Test that --ignore-policy-conflict flag allows proceeding with import."""
+    from click.testing import CliRunner
+    from repair_cli.cli import cli
+
+    service.update_policy(
+        actor="admin_user",
+        allow_admin_self_approval=False,
+        require_different_approver=False,
+    )
+
+    fd, export_path = tempfile.mkstemp(suffix=".json")
+    os.close(fd)
+    try:
+        export_service.export_to_file(export_path)
+
+        fd, new_db_path = tempfile.mkstemp(suffix=".sqlite")
+        os.close(fd)
+        try:
+            new_db = Database(f"sqlite:///{new_db_path}")
+            new_db.init_db()
+            new_db.init_default_roles()
+            new_db.init_default_policy()
+            new_policy_repo = PolicyRepository(new_db)
+            new_policy_repo.update(
+                allow_admin_self_approval=True,
+                require_different_approver=True,
+                updated_by="existing_admin",
+            )
+
+            runner = CliRunner()
+
+            result = runner.invoke(cli, [
+                "--db", new_db_path,
+                "--format", "json",
+                "plan", "import", export_path,
+                "--as-user", "importer",
+            ])
+            assert result.exit_code != 0
+            error = json.loads(result.output)
+            assert error["code"] == "policy_conflict"
+
+            result = runner.invoke(cli, [
+                "--db", new_db_path,
+                "--format", "json",
+                "plan", "import", export_path,
+                "--ignore-policy-conflict",
+                "--as-user", "importer",
+            ])
+            assert result.exit_code == 0, result.output
+
+            policy = new_policy_repo.get()
+            assert policy.allow_admin_self_approval is False
+            assert policy.require_different_approver is False
+        finally:
+            try:
+                os.unlink(new_db_path)
+            except OSError:
+                pass
+    finally:
+        try:
+            os.unlink(export_path)
+        except OSError:
+            pass
+
+
+def test_imported_policy_affects_approval(export_service, service, active_window, role_repo):
+    """Test that imported policy actually affects approval behavior."""
+    from repair_cli.service import RepairService
+
+    role_repo.set_role("test_admin", Role.ADMIN)
+    service.update_policy(
+        actor="admin_user",
+        allow_admin_self_approval=False,
+        require_different_approver=True,
+    )
+
+    task = service.create_task(RepairTask(
+        name="imported-policy-test",
+        description="test",
+        created_by="test_admin",
+        sql="UPDATE ...",
+        rollback_sql="UPDATE ...",
+        window_id=active_window.id,
+    ))
+    service.submit_for_approval(task.id, "test_admin")
+
+    plan = export_service.export_plan()
+
+    fd, new_db_path = tempfile.mkstemp(suffix=".sqlite")
+    os.close(fd)
+    try:
+        new_db = Database(f"sqlite:///{new_db_path}")
+        new_db.init_db()
+        new_db.init_default_roles()
+        new_db.init_default_policy()
+        new_export = ExportImportService(new_db)
+        new_export.import_plan(plan, actor="importer")
+
+        new_service = RepairService(new_db)
+        new_service.role_repo.set_role("test_admin", Role.ADMIN)
+
+        imported_tasks = new_service.task_repo.list()
+        imported_task = next(t for t in imported_tasks if t.name == "imported-policy-test")
+
+        with pytest.raises(ValidationError, match="cannot approve their own task"):
+            new_service.approve_task(imported_task.id, "test_admin")
     finally:
         try:
             os.unlink(new_db_path)

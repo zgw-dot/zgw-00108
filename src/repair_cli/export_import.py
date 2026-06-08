@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 from dateutil import parser as date_parser
 
 from .models import (
+    ApprovalPolicy,
     AuditLog,
     MaintenanceWindow,
     RepairTask,
@@ -16,6 +17,7 @@ from .models import (
 from .persistence import (
     AuditRepository,
     Database,
+    PolicyRepository,
     TaskRepository,
     WindowRepository,
 )
@@ -28,6 +30,7 @@ class ExportImportService:
         self.task_repo = TaskRepository(db)
         self.window_repo = WindowRepository(db)
         self.audit_repo = AuditRepository(db)
+        self.policy_repo = PolicyRepository(db)
 
     def _parse_datetime(self, value: Optional[str]) -> Optional[datetime]:
         if not value:
@@ -48,9 +51,16 @@ class ExportImportService:
         for tid in all_task_ids:
             audits.extend(self.audit_repo.list_by_task(tid))
 
+        policy = self.policy_repo.get()
         plan = {
             "version": "1.0",
             "exported_at": datetime.utcnow().isoformat(),
+            "policy": {
+                "allow_admin_self_approval": policy.allow_admin_self_approval,
+                "require_different_approver": policy.require_different_approver,
+                "updated_by": policy.updated_by,
+                "updated_at": policy.updated_at.isoformat() if policy.updated_at else None,
+            },
             "windows": [],
             "tasks": [],
             "audit_logs": [],
@@ -115,6 +125,32 @@ class ExportImportService:
                 code="unsupported_version",
             ))
             return errors
+
+        import_policy = plan.get("policy")
+        if import_policy:
+            current_policy = self.policy_repo.get()
+            policy_conflicts = []
+
+            import_allow_admin = import_policy.get("allow_admin_self_approval")
+            if import_allow_admin is not None and import_allow_admin != current_policy.allow_admin_self_approval:
+                policy_conflicts.append(
+                    f"allow_admin_self_approval: local={current_policy.allow_admin_self_approval}, "
+                    f"imported={import_allow_admin}"
+                )
+
+            import_require_diff = import_policy.get("require_different_approver")
+            if import_require_diff is not None and import_require_diff != current_policy.require_different_approver:
+                policy_conflicts.append(
+                    f"require_different_approver: local={current_policy.require_different_approver}, "
+                    f"imported={import_require_diff}"
+                )
+
+            if policy_conflicts:
+                errors.append(ValidationError(
+                    f"Policy conflict detected: {'; '.join(policy_conflicts)}. "
+                    f"Import will overwrite local policy.",
+                    code="policy_conflict",
+                ))
 
         existing_windows = self.window_repo.list()
         existing_window_names = {w.name for w in existing_windows}
@@ -209,10 +245,11 @@ class ExportImportService:
 
     def import_plan(self, plan: Dict[str, Any], actor: str = "import") -> Dict[str, Any]:
         errors = self.validate_import_plan(plan)
-        if errors:
+        non_policy_errors = [e for e in errors if e.code != "policy_conflict"]
+        if non_policy_errors:
             raise ValidationError(
-                f"Import validation failed with {len(errors)} error(s): "
-                + "; ".join(e.message for e in errors),
+                f"Import validation failed with {len(non_policy_errors)} error(s): "
+                + "; ".join(e.message for e in non_policy_errors),
                 code="import_validation_failed",
             )
 
@@ -314,6 +351,16 @@ class ExportImportService:
                     )
                     self.audit_repo.log(audit)
 
+                policy_imported = False
+                policy_data = plan.get("policy")
+                if policy_data:
+                    self.policy_repo.update(
+                        allow_admin_self_approval=policy_data.get("allow_admin_self_approval"),
+                        require_different_approver=policy_data.get("require_different_approver"),
+                        updated_by=actor,
+                    )
+                    policy_imported = True
+
                 session.commit()
 
             except Exception:
@@ -324,6 +371,7 @@ class ExportImportService:
             "windows_imported": len(plan.get("windows", [])),
             "tasks_imported": len(plan.get("tasks", [])),
             "audits_imported": len(plan.get("audit_logs", [])),
+            "policy_imported": policy_imported,
             "window_id_map": window_id_map,
             "task_id_map": task_id_map,
         }

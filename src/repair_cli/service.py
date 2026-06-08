@@ -6,8 +6,10 @@ from datetime import datetime
 from typing import Callable, Optional, Tuple
 
 from .models import (
+    ApprovalPolicy,
     AuditLog,
     MaintenanceWindow,
+    PolicyUpdateResult,
     RepairTask,
     Role,
     TaskStatus,
@@ -15,6 +17,7 @@ from .models import (
 from .persistence import (
     AuditRepository,
     Database,
+    PolicyRepository,
     RoleRepository,
     TaskRepository,
     WindowRepository,
@@ -29,7 +32,13 @@ class RepairService:
         self.window_repo = WindowRepository(db)
         self.audit_repo = AuditRepository(db)
         self.role_repo = RoleRepository(db)
-        self.validator = Validator(self.task_repo, self.window_repo, self.role_repo)
+        self.policy_repo = PolicyRepository(db)
+        self.validator = Validator(
+            self.task_repo,
+            self.window_repo,
+            self.role_repo,
+            self.policy_repo,
+        )
         self.sql_executor = sql_executor or self._default_sql_executor
 
     @staticmethod
@@ -313,4 +322,56 @@ class RepairService:
             action="role_set",
             actor=actor,
             details=f"Set role '{role.value}' for user '{username}'",
+        )
+
+    def get_policy(self) -> ApprovalPolicy:
+        return self.policy_repo.get()
+
+    def update_policy(
+        self,
+        actor: str,
+        allow_admin_self_approval: Optional[bool] = None,
+        require_different_approver: Optional[bool] = None,
+    ) -> PolicyUpdateResult:
+        if not self.role_repo.has_role(actor, Role.ADMIN):
+            self._audit(
+                task_id=None,
+                action="policy_update_denied",
+                actor=actor,
+                details=f"User '{actor}' attempted to update policy without admin permission",
+            )
+            raise ValidationError(
+                f"User '{actor}' does not have admin role to update policy",
+                code="policy_update_denied",
+            )
+
+        old_policy = self.policy_repo.get()
+        changed_fields: list[str] = []
+
+        if allow_admin_self_approval is not None and old_policy.allow_admin_self_approval != allow_admin_self_approval:
+            changed_fields.append("allow_admin_self_approval")
+        if require_different_approver is not None and old_policy.require_different_approver != require_different_approver:
+            changed_fields.append("require_different_approver")
+
+        new_policy = self.policy_repo.update(
+            allow_admin_self_approval=allow_admin_self_approval,
+            require_different_approver=require_different_approver,
+            updated_by=actor,
+        )
+
+        self._audit(
+            task_id=None,
+            action="policy_updated",
+            actor=actor,
+            details=f"Policy updated. Changed fields: {', '.join(changed_fields) if changed_fields else 'none'}. "
+                    f"Old: allow_admin_self_approval={old_policy.allow_admin_self_approval}, "
+                    f"require_different_approver={old_policy.require_different_approver}. "
+                    f"New: allow_admin_self_approval={new_policy.allow_admin_self_approval}, "
+                    f"require_different_approver={new_policy.require_different_approver}",
+        )
+
+        return PolicyUpdateResult(
+            old_policy=old_policy,
+            new_policy=new_policy,
+            changed_fields=changed_fields,
         )

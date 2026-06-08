@@ -15,6 +15,7 @@ from .formatters import (
     error_response,
     format_audit_table,
     format_output,
+    format_policy_table,
     format_roles_table,
     format_task_detail,
     format_tasks_table,
@@ -45,6 +46,7 @@ def get_db(db_path: Optional[str] = None) -> Database:
     db = Database(db_url)
     db.init_db()
     db.init_default_roles()
+    db.init_default_policy()
     return db
 
 
@@ -432,6 +434,67 @@ def role_set(ctx: click.Context, username: str, role_name: str, as_user: str) ->
 
 
 @cli.group()
+def policy() -> None:
+    """Manage approval policies."""
+    pass
+
+
+@policy.command("view")
+@click.pass_context
+def policy_view(ctx: click.Context) -> None:
+    """View current approval policy."""
+    output_format = ctx.obj["output_format"]
+    try:
+        service = get_service(ctx.obj["db_path"])
+        policy = service.get_policy()
+        click.echo(format_output(policy, output_format, format_policy_table))
+    except Exception as e:
+        handle_error(e, output_format)
+
+
+@policy.command("set")
+@click.option("--allow-admin-self-approval", type=click.Choice(["true", "false"]),
+              help="Allow admin to approve their own tasks")
+@click.option("--require-different-approver", type=click.Choice(["true", "false"]),
+              help="Require approver to be different from creator")
+@click.option("--as-user", default="admin_user", help="Acting user")
+@click.pass_context
+def policy_set(ctx: click.Context, allow_admin_self_approval: Optional[str],
+               require_different_approver: Optional[str], as_user: str) -> None:
+    """Update approval policy (admin only)."""
+    output_format = ctx.obj["output_format"]
+    try:
+        if allow_admin_self_approval is None and require_different_approver is None:
+            handle_error(ValidationError(
+                "At least one policy option must be specified",
+                code="missing_policy_option",
+            ), output_format)
+            return
+
+        service = get_service(ctx.obj["db_path"])
+        result = service.update_policy(
+            actor=as_user,
+            allow_admin_self_approval=(allow_admin_self_approval == "true") if allow_admin_self_approval else None,
+            require_different_approver=(require_different_approver == "true") if require_different_approver else None,
+        )
+        click.echo(success_response(
+            "Policy updated",
+            output_format,
+            changed_fields=result.changed_fields,
+            old_policy={
+                "allow_admin_self_approval": result.old_policy.allow_admin_self_approval,
+                "require_different_approver": result.old_policy.require_different_approver,
+            },
+            new_policy={
+                "allow_admin_self_approval": result.new_policy.allow_admin_self_approval,
+                "require_different_approver": result.new_policy.require_different_approver,
+            },
+        ))
+    except Exception as e:
+        handle_error(e, output_format)
+
+
+@cli.group()
 def plan() -> None:
     """Export and import repair plans."""
     pass
@@ -462,8 +525,11 @@ def plan_export(ctx: click.Context, filepath: str, task_ids: tuple) -> None:
 @click.argument("filepath")
 @click.option("--as-user", default="import", help="Acting user for import")
 @click.option("--dry-run", is_flag=True, help="Validate only, don't import")
+@click.option("--ignore-policy-conflict", is_flag=True,
+              help="Proceed even if policy conflicts are detected")
 @click.pass_context
-def plan_import(ctx: click.Context, filepath: str, as_user: str, dry_run: bool) -> None:
+def plan_import(ctx: click.Context, filepath: str, as_user: str, dry_run: bool,
+                ignore_policy_conflict: bool) -> None:
     """Import repair plan from a JSON file."""
     output_format = ctx.obj["output_format"]
     try:
@@ -474,25 +540,47 @@ def plan_import(ctx: click.Context, filepath: str, as_user: str, dry_run: bool) 
             plan = json.load(f)
 
         errors = service.validate_import_plan(plan)
-        if errors:
-            error_msgs = "; ".join(e.message for e in errors)
+
+        policy_conflicts = [e for e in errors if e.code == "policy_conflict"]
+        other_errors = [e for e in errors if e.code != "policy_conflict"]
+
+        if policy_conflicts and not ignore_policy_conflict and not dry_run:
+            conflict_msg = "; ".join(e.message for e in policy_conflicts)
             handle_error(ValidationError(
-                f"Import validation failed with {len(errors)} error(s): {error_msgs}",
+                f"Policy conflict detected. Use --ignore-policy-conflict to proceed. {conflict_msg}",
+                code="policy_conflict",
+            ), output_format)
+            return
+
+        if other_errors:
+            error_msgs = "; ".join(e.message for e in other_errors)
+            handle_error(ValidationError(
+                f"Import validation failed with {len(other_errors)} error(s): {error_msgs}",
                 code="import_validation_failed",
             ), output_format)
             return
 
         if dry_run:
+            extra_info = {
+                "windows_to_import": len(plan.get("windows", [])),
+                "tasks_to_import": len(plan.get("tasks", [])),
+                "audits_to_import": len(plan.get("audit_logs", [])),
+            }
+            if "policy" in plan:
+                extra_info["policy_to_import"] = plan["policy"]
+            if policy_conflicts:
+                extra_info["policy_conflicts"] = [e.message for e in policy_conflicts]
+                extra_info["note"] = "Use --ignore-policy-conflict to import despite conflicts"
             click.echo(success_response(
                 "Import validation passed (dry run)",
                 output_format,
-                windows_to_import=len(plan.get("windows", [])),
-                tasks_to_import=len(plan.get("tasks", [])),
-                audits_to_import=len(plan.get("audit_logs", [])),
+                **extra_info,
             ))
             return
 
         result = service.import_plan(plan, actor=as_user)
+        if policy_conflicts:
+            result["policy_conflicts_resolved"] = [e.message for e in policy_conflicts]
         click.echo(success_response(
             "Plan imported successfully",
             output_format,

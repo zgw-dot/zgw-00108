@@ -12,6 +12,7 @@ from repair_cli.models import (
 )
 from repair_cli.persistence import (
     AuditRepository,
+    PolicyRepository,
     RoleRepository,
     TaskRepository,
     WindowRepository,
@@ -187,3 +188,74 @@ def test_concurrent_update_optimistic_lock(db, draft_task):
 
     refreshed = repo.get(draft_task.id)
     assert refreshed.status == TaskStatus.PENDING_APPROVAL
+
+
+def test_policy_default_values(db):
+    """Test that policy has correct default values."""
+    repo = PolicyRepository(db)
+    policy = repo.get()
+    assert policy.allow_admin_self_approval is True
+    assert policy.require_different_approver is True
+    assert policy.updated_by is None
+
+
+def test_policy_update_persistence(db):
+    """Test that policy updates are persisted."""
+    repo = PolicyRepository(db)
+
+    updated = repo.update(
+        allow_admin_self_approval=False,
+        require_different_approver=False,
+        updated_by="admin_user",
+    )
+    assert updated.allow_admin_self_approval is False
+    assert updated.require_different_approver is False
+    assert updated.updated_by == "admin_user"
+
+    fetched = repo.get()
+    assert fetched.allow_admin_self_approval is False
+    assert fetched.require_different_approver is False
+    assert fetched.updated_by == "admin_user"
+
+
+def test_policy_partial_update(db):
+    """Test partial policy update only changes specified fields."""
+    repo = PolicyRepository(db)
+
+    repo.update(
+        allow_admin_self_approval=False,
+        updated_by="admin_user",
+    )
+
+    policy = repo.get()
+    assert policy.allow_admin_self_approval is False
+    assert policy.require_different_approver is True
+
+    repo.update(
+        require_different_approver=False,
+        updated_by="admin_user",
+    )
+
+    policy = repo.get()
+    assert policy.allow_admin_self_approval is False
+    assert policy.require_different_approver is False
+
+
+def test_policy_persistence_across_reconnect(db, db_path):
+    """Test that policy persists after database reconnect."""
+    from repair_cli.persistence import Database
+
+    repo = PolicyRepository(db)
+    repo.update(
+        allow_admin_self_approval=False,
+        require_different_approver=False,
+        updated_by="test_admin",
+    )
+
+    new_db = Database(f"sqlite:///{db_path}")
+    new_repo = PolicyRepository(new_db)
+    policy = new_repo.get()
+
+    assert policy.allow_admin_self_approval is False
+    assert policy.require_different_approver is False
+    assert policy.updated_by == "test_admin"

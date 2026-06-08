@@ -18,6 +18,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import Session, declarative_base, relationship, sessionmaker
 
 from .models import (
+    ApprovalPolicy as ApprovalPolicyModel,
     AuditLog as AuditLogModel,
     MaintenanceWindow as MaintenanceWindowModel,
     RepairTask as RepairTaskModel,
@@ -93,6 +94,16 @@ class RoleRule(Base):
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
 
+class ApprovalPolicy(Base):
+    __tablename__ = "approval_policies"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    allow_admin_self_approval = Column(Integer, nullable=False, default=1)
+    require_different_approver = Column(Integer, nullable=False, default=1)
+    updated_by = Column(String(255))
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class Database:
     def __init__(self, db_url: str = "sqlite:///repair.db"):
         self.engine = create_engine(db_url, echo=False, future=True)
@@ -124,6 +135,18 @@ class Database:
                 if not existing:
                     rr = RoleRule(username=username, role=role.value)
                     session.add(rr)
+            session.commit()
+
+    def init_default_policy(self) -> None:
+        with self.session() as session:
+            existing = session.query(ApprovalPolicy).first()
+            if not existing:
+                policy = ApprovalPolicy(
+                    allow_admin_self_approval=1,
+                    require_different_approver=1,
+                    updated_by=None,
+                )
+                session.add(policy)
             session.commit()
 
 
@@ -180,6 +203,16 @@ def _to_role_model(db_role: RoleRule) -> RoleRuleModel:
         username=db_role.username,
         role=Role(db_role.role),
         created_at=db_role.created_at,
+    )
+
+
+def _to_policy_model(db_policy: ApprovalPolicy) -> ApprovalPolicyModel:
+    return ApprovalPolicyModel(
+        id=db_policy.id,
+        allow_admin_self_approval=bool(db_policy.allow_admin_self_approval),
+        require_different_approver=bool(db_policy.require_different_approver),
+        updated_by=db_policy.updated_by,
+        updated_at=db_policy.updated_at,
     )
 
 
@@ -398,3 +431,50 @@ class RoleRepository:
         if required_role == Role.APPROVER:
             return user_role in (Role.APPROVER, Role.ADMIN)
         return user_role == required_role
+
+
+class PolicyRepository:
+    def __init__(self, db: Database):
+        self.db = db
+
+    def get(self) -> ApprovalPolicyModel:
+        with self.db.session() as session:
+            db_policy = session.query(ApprovalPolicy).order_by(ApprovalPolicy.id.desc()).first()
+            if not db_policy:
+                default = ApprovalPolicy(
+                    allow_admin_self_approval=1,
+                    require_different_approver=1,
+                    updated_by="system",
+                )
+                session.add(default)
+                session.commit()
+                session.refresh(default)
+                db_policy = default
+            return _to_policy_model(db_policy)
+
+    def update(
+        self,
+        allow_admin_self_approval: Optional[bool] = None,
+        require_different_approver: Optional[bool] = None,
+        updated_by: Optional[str] = None,
+    ) -> ApprovalPolicyModel:
+        with self.db.session() as session:
+            db_policy = session.query(ApprovalPolicy).order_by(ApprovalPolicy.id.desc()).with_for_update().first()
+            if not db_policy:
+                db_policy = ApprovalPolicy(
+                    allow_admin_self_approval=1,
+                    require_different_approver=1,
+                    updated_by=updated_by,
+                )
+                session.add(db_policy)
+            else:
+                if allow_admin_self_approval is not None:
+                    db_policy.allow_admin_self_approval = 1 if allow_admin_self_approval else 0
+                if require_different_approver is not None:
+                    db_policy.require_different_approver = 1 if require_different_approver else 0
+                if updated_by is not None:
+                    db_policy.updated_by = updated_by
+                db_policy.updated_at = datetime.utcnow()
+            session.commit()
+            session.refresh(db_policy)
+            return _to_policy_model(db_policy)

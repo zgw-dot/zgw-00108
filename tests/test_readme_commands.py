@@ -283,7 +283,9 @@ class TestReadmeCommands:
         ])
         assert result.returncode != 0
         # Click writes option errors to stderr
-        assert "No such option: --format" in result.stderr or "No such option: --format" in result.stdout
+        # Handle both old ("No such option: --format") and new ("No such option '--format'.") Click formats
+        assert ("--format" in result.stderr and "such option" in result.stderr) or \
+               ("--format" in result.stdout and "such option" in result.stdout)
 
         # This should SUCCEED because --format is before the subcommand
         result = run_command([

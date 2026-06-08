@@ -12,6 +12,7 @@ from .models import (
     TaskStatus,
 )
 from .persistence import (
+    PolicyRepository,
     RoleRepository,
     TaskRepository,
     WindowRepository,
@@ -31,10 +32,29 @@ class Validator:
         task_repo: TaskRepository,
         window_repo: WindowRepository,
         role_repo: RoleRepository,
+        policy_repo: Optional[PolicyRepository] = None,
     ):
         self.task_repo = task_repo
         self.window_repo = window_repo
         self.role_repo = role_repo
+        self.policy_repo = policy_repo
+
+    def _get_policy(self):
+        if self.policy_repo:
+            return self.policy_repo.get()
+        from .models import ApprovalPolicy
+        return ApprovalPolicy()
+
+    def _can_approve_own_task(self, actor: str) -> bool:
+        policy = self._get_policy()
+        is_admin = self.role_repo.has_role(actor, Role.ADMIN)
+        if is_admin:
+            return policy.allow_admin_self_approval
+        return False
+
+    def _requires_different_approver(self) -> bool:
+        policy = self._get_policy()
+        return policy.require_different_approver
 
     def validate_window_creation(self, window: MaintenanceWindow) -> None:
         if window.end_time <= window.start_time:
@@ -175,11 +195,13 @@ class Validator:
                 code="permission_denied",
             )
 
-        if task.created_by == actor and not self.role_repo.has_role(actor, Role.ADMIN):
-            raise ValidationError(
-                f"User '{actor}' cannot approve their own task (created_by={task.created_by})",
-                code="self_approval_not_allowed",
-            )
+        if self._requires_different_approver() and task.created_by == actor:
+            if not self._can_approve_own_task(actor):
+                raise ValidationError(
+                    f"User '{actor}' cannot approve their own task (created_by={task.created_by}). "
+                    f"Policy requires different approver.",
+                    code="self_approval_not_allowed",
+                )
 
         window = self.window_repo.get(task.window_id)
         if not window:
@@ -213,11 +235,13 @@ class Validator:
                 code="permission_denied",
             )
 
-        if task.created_by == actor:
-            raise ValidationError(
-                f"User '{actor}' cannot reject their own task",
-                code="self_rejection_not_allowed",
-            )
+        if self._requires_different_approver() and task.created_by == actor:
+            if not self._can_approve_own_task(actor):
+                raise ValidationError(
+                    f"User '{actor}' cannot reject their own task (created_by={task.created_by}). "
+                    f"Policy requires different approver.",
+                    code="self_rejection_not_allowed",
+                )
 
         return task
 

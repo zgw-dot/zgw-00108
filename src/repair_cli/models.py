@@ -95,3 +95,17 @@ class RoleRule(BaseModel):
         if not v or not v.strip():
             raise ValueError("Cannot be empty")
         return v.strip()
+
+
+class ApprovalPolicy(BaseModel):
+    id: Optional[int] = None
+    allow_admin_self_approval: bool = True
+    require_different_approver: bool = True
+    updated_by: Optional[str] = None
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class PolicyUpdateResult(BaseModel):
+    old_policy: ApprovalPolicy
+    new_policy: ApprovalPolicy
+    changed_fields: list[str]

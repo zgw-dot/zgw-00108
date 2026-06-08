@@ -1,6 +1,7 @@
 README.md
 pyproject.toml
 src/repair_cli/__init__.py
+src/repair_cli/__main__.py
 src/repair_cli/cli.py
 src/repair_cli/export_import.py
 src/repair_cli/formatters.py
@@ -17,5 +18,6 @@ src/repair_cli.egg-info/top_level.txt
 tests/test_cli.py
 tests/test_export_import.py
 tests/test_persistence.py
+tests/test_readme_commands.py
 tests/test_service.py
 tests/test_validation.py

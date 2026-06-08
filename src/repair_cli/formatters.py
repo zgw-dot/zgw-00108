@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 from tabulate import tabulate
 
 from .models import (
+    ApprovalPolicy,
     AuditLog,
     MaintenanceWindow,
     RepairTask,
@@ -119,6 +120,16 @@ def format_roles_table(roles: List[RoleRule]) -> str:
     return tabulate(rows, headers=headers, tablefmt="grid")
 
 
+def format_policy_table(policy: ApprovalPolicy) -> str:
+    rows = [
+        ["Allow Admin Self-Approval", "Yes" if policy.allow_admin_self_approval else "No"],
+        ["Require Different Approver", "Yes" if policy.require_different_approver else "No"],
+        ["Updated By", policy.updated_by or "(default)"],
+        ["Updated At", _format_datetime(policy.updated_at)],
+    ]
+    return tabulate(rows, headers=["Policy Setting", "Value"], tablefmt="grid")
+
+
 def _task_to_dict(task: RepairTask) -> Dict[str, Any]:
     return {
         "id": task.id,
@@ -175,6 +186,16 @@ def _role_to_dict(role: RoleRule) -> Dict[str, Any]:
     }
 
 
+def _policy_to_dict(policy: ApprovalPolicy) -> Dict[str, Any]:
+    return {
+        "id": policy.id,
+        "allow_admin_self_approval": policy.allow_admin_self_approval,
+        "require_different_approver": policy.require_different_approver,
+        "updated_by": policy.updated_by,
+        "updated_at": _format_datetime(policy.updated_at),
+    }
+
+
 def to_json(data: Any, indent: int = 2) -> str:
     if isinstance(data, list):
         items = []
@@ -198,6 +219,8 @@ def to_json(data: Any, indent: int = 2) -> str:
         return json.dumps(_audit_to_dict(data), indent=indent, ensure_ascii=False)
     elif isinstance(data, RoleRule):
         return json.dumps(_role_to_dict(data), indent=indent, ensure_ascii=False)
+    elif isinstance(data, ApprovalPolicy):
+        return json.dumps(_policy_to_dict(data), indent=indent, ensure_ascii=False)
     else:
         return json.dumps(data, indent=indent, ensure_ascii=False)
 
