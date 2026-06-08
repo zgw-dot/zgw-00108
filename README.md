@@ -91,7 +91,7 @@ repair audit list --task-id 1
 repair window create --name "emergency" --start "+1h" --end "+3h"
 
 # List all windows
-repair window list --format json
+repair --format json window list
 
 # Show window details
 repair window show 1
@@ -271,7 +271,7 @@ repair --db verify_admin.db task approve 1 --as-user admin_user
 repair --db verify_admin.db task run 1 --as-user admin_user
 
 # Verify status
-repair --db verify_admin.db task show 1 --format json
+repair --db verify_admin.db --format json task show 1
 
 # Cleanup
 rm verify_admin.db
@@ -312,16 +312,16 @@ repair --db verify_rollback.db task create \
   --as-user operator_user
 
 # Get initial audit count
-repair --db verify_rollback.db audit list --task-id 1 --format json | python -c "import sys,json; print('Initial audit count:', len(json.load(sys.stdin)))"
+repair --db verify_rollback.db --format json audit list --task-id 1 | python -c "import sys,json; print('Initial audit count:', len(json.load(sys.stdin)))"
 
 # Try to rollback before execution (should fail)
-repair --db verify_rollback.db task rollback 1 --as-user operator_user --format json
+repair --db verify_rollback.db --format json task rollback 1 --as-user operator_user
 
 # Verify task status is unchanged
-repair --db verify_rollback.db task show 1 --format json | python -c "import sys,json; print('Status:', json.load(sys.stdin)['status'])"
+repair --db verify_rollback.db --format json task show 1 | python -c "import sys,json; print('Status:', json.load(sys.stdin)['status'])"
 
 # Verify audit log has the failure record
-repair --db verify_rollback.db audit list --task-id 1 --format json
+repair --db verify_rollback.db --format json audit list --task-id 1
 
 # Cleanup
 rm verify_rollback.db
@@ -365,7 +365,7 @@ repair --db verify_regular.db task create \
 repair --db verify_regular.db task submit 1 --as-user operator_user
 
 # Regular user tries to approve their own task (should fail)
-repair --db verify_regular.db task approve 1 --as-user operator_user --format json
+repair --db verify_regular.db --format json task approve 1 --as-user operator_user
 
 # Cleanup
 rm verify_regular.db
