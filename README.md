@@ -159,12 +159,13 @@ DRAFT → PENDING_APPROVAL → APPROVED → RUNNING → SUCCEEDED → ROLLBACK_R
 
 ### Validation Rules
 - **Window Overlap**: New windows cannot overlap with existing windows
-- **Self-Approval**: Users cannot approve or reject their own tasks
+- **Self-Approval**: Regular users cannot approve or reject their own tasks. **Admin users are exempt** and can approve/reject their own tasks to complete the full lifecycle.
 - **State Enforcement**: Actions only allowed from valid states
 - **Window Expiry**: Cannot submit/approve tasks for windows that have ended
-- **Rollback Timing**: Can only rollback after execution (SUCCEEDED or FAILED)
+- **Rollback Timing**: Can only rollback after execution (SUCCEEDED or FAILED). Failed rollback attempts are logged to audit.
 - **Window Lock**: Cannot modify window times if tasks are in active states
 - **Import References**: Tasks must reference existing windows during import
+- **Audit Logging**: All actions (including failed attempts) are logged to the audit table with actor, action, status transitions, and reason.
 
 ## Testing
 
@@ -236,3 +237,145 @@ All errors produce consistent output:
 | `role` | `set` | Set user role |
 | `plan` | `export` | Export plan to JSON |
 | `plan` | `import` | Import plan from JSON |
+
+## Bug Fix Verification Commands
+
+### Fix 1: Admin Self-Approval Exception
+
+Admin users can now complete the full lifecycle on their own tasks:
+
+```bash
+# Setup: Create a window (admin)
+repair --db verify_admin.db window create \
+  --name "admin-test-window" \
+  --description "Admin self-workflow test" \
+  --start "-1h" --end "+3h" \
+  --as-user admin_user
+
+# Admin creates their own task
+repair --db verify_admin.db task create \
+  --name "admin-self-task" \
+  --description "Test admin self-approval" \
+  --sql "UPDATE users SET email = LOWER(email)" \
+  --rollback-sql "UPDATE users SET email = UPPER(email)" \
+  --window-id 1 \
+  --as-user admin_user
+
+# Admin submits their own task
+repair --db verify_admin.db task submit 1 --as-user admin_user
+
+# Admin approves their own task (was blocked before, now works)
+repair --db verify_admin.db task approve 1 --as-user admin_user
+
+# Admin executes their own task (was blocked before, now works)
+repair --db verify_admin.db task run 1 --as-user admin_user
+
+# Verify status
+repair --db verify_admin.db task show 1 --format json
+
+# Cleanup
+rm verify_admin.db
+```
+
+**Expected JSON output for status check:**
+```json
+{
+  "id": 1,
+  "name": "admin-self-task",
+  "status": "succeeded",
+  "created_by": "admin_user",
+  "approved_by": "admin_user",
+  "executed_by": "admin_user"
+}
+```
+
+---
+
+### Fix 2: Failed Rollback Audit Logging
+
+Failed rollback attempts (before task execution) now write an audit record:
+
+```bash
+# Setup: Create a window and task
+repair --db verify_rollback.db window create \
+  --name "rollback-test-window" \
+  --description "Rollback audit test" \
+  --start "-1h" --end "+3h" \
+  --as-user admin_user
+
+repair --db verify_rollback.db task create \
+  --name "rollback-test-task" \
+  --description "Test failed rollback audit" \
+  --sql "UPDATE ..." \
+  --rollback-sql "UPDATE ..." \
+  --window-id 1 \
+  --as-user operator_user
+
+# Get initial audit count
+repair --db verify_rollback.db audit list --task-id 1 --format json | python -c "import sys,json; print('Initial audit count:', len(json.load(sys.stdin)))"
+
+# Try to rollback before execution (should fail)
+repair --db verify_rollback.db task rollback 1 --as-user operator_user --format json
+
+# Verify task status is unchanged
+repair --db verify_rollback.db task show 1 --format json | python -c "import sys,json; print('Status:', json.load(sys.stdin)['status'])"
+
+# Verify audit log has the failure record
+repair --db verify_rollback.db audit list --task-id 1 --format json
+
+# Cleanup
+rm verify_rollback.db
+```
+
+**Expected audit log entry for failed rollback:**
+```json
+{
+  "id": 2,
+  "task_id": 1,
+  "action": "task_rollback_rejected",
+  "actor": "operator_user",
+  "old_status": "draft",
+  "new_status": "draft",
+  "details": "Task 1 is in state draft, must be 'succeeded' or 'failed' to rollback",
+  "created_at": "2025-01-15 02:30:00 UTC"
+}
+```
+
+---
+
+### Regression: Regular User Self-Approval Still Blocked
+
+Verify regular users still cannot approve their own tasks:
+
+```bash
+# Setup
+repair --db verify_regular.db window create \
+  --name "regular-test-window" \
+  --start "-1h" --end "+3h" \
+  --as-user admin_user
+
+repair --db verify_regular.db task create \
+  --name "regular-self-task" \
+  --description "Test regular user self-approval blocked" \
+  --sql "UPDATE ..." \
+  --rollback-sql "UPDATE ..." \
+  --window-id 1 \
+  --as-user operator_user
+
+repair --db verify_regular.db task submit 1 --as-user operator_user
+
+# Regular user tries to approve their own task (should fail)
+repair --db verify_regular.db task approve 1 --as-user operator_user --format json
+
+# Cleanup
+rm verify_regular.db
+```
+
+**Expected error JSON:**
+```json
+{
+  "success": false,
+  "error": "User 'operator_user' cannot approve their own task (created_by=operator_user)",
+  "code": "self_approval_not_allowed"
+}
+```

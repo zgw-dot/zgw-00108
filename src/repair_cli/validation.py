@@ -175,7 +175,7 @@ class Validator:
                 code="permission_denied",
             )
 
-        if task.created_by == actor:
+        if task.created_by == actor and not self.role_repo.has_role(actor, Role.ADMIN):
             raise ValidationError(
                 f"User '{actor}' cannot approve their own task (created_by={task.created_by})",
                 code="self_approval_not_allowed",

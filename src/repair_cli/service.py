@@ -224,7 +224,20 @@ class RepairService:
             raise
 
     def rollback_task(self, task_id: int, actor: str) -> RepairTask:
-        task = self.validator.validate_rollback(task_id, actor)
+        task = self.task_repo.get(task_id)
+        try:
+            task = self.validator.validate_rollback(task_id, actor)
+        except ValidationError as e:
+            if task:
+                self._audit(
+                    task_id=task_id,
+                    action="task_rollback_rejected",
+                    actor=actor,
+                    old_status=task.status.value,
+                    new_status=task.status.value,
+                    details=e.message,
+                )
+            raise
         old_status = task.status.value
         now = datetime.utcnow()
 

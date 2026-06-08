@@ -451,3 +451,223 @@ def test_cli_roles(runner: CliRunner, db_path):
     roles = json.loads(result.output)
     usernames = [r["username"] for r in roles]
     assert "new_user" in usernames
+
+
+def test_cli_admin_full_self_workflow(runner: CliRunner, db_path):
+    """Test that admin can create, submit, approve, and run their own task."""
+    start = (datetime.utcnow() - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+    end = (datetime.utcnow() + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S")
+
+    runner.invoke(cli, [
+        "--db", db_path,
+        "window", "create",
+        "--name", "admin-self-workflow-win",
+        "--start", start,
+        "--end", end,
+        "--as-user", "admin_user",
+    ])
+
+    result = runner.invoke(cli, [
+        "--db", db_path,
+        "--format", "json",
+        "window", "list",
+    ])
+    windows = json.loads(result.output)
+    window_id = windows[0]["id"]
+
+    result = runner.invoke(cli, [
+        "--db", db_path,
+        "task", "create",
+        "--name", "admin-self-task",
+        "--description", "test",
+        "--sql", "UPDATE ...",
+        "--rollback-sql", "UPDATE ...",
+        "--window-id", str(window_id),
+        "--as-user", "admin_user",
+    ])
+    assert result.exit_code == 0, result.output
+
+    result = runner.invoke(cli, [
+        "--db", db_path,
+        "--format", "json",
+        "task", "list",
+    ])
+    tasks = json.loads(result.output)
+    task_id = tasks[0]["id"]
+
+    result = runner.invoke(cli, [
+        "--db", db_path,
+        "task", "submit", str(task_id),
+        "--as-user", "admin_user",
+    ])
+    assert result.exit_code == 0, result.output
+
+    result = runner.invoke(cli, [
+        "--db", db_path,
+        "--format", "json",
+        "task", "approve", str(task_id),
+        "--as-user", "admin_user",
+    ])
+    assert result.exit_code == 0, result.output
+    response = json.loads(result.output)
+    assert response["success"] is True
+    assert response["status"] == "approved"
+
+    result = runner.invoke(cli, [
+        "--db", db_path,
+        "--format", "json",
+        "task", "run", str(task_id),
+        "--as-user", "admin_user",
+    ])
+    assert result.exit_code == 0, result.output
+    response = json.loads(result.output)
+    assert response["success"] is True
+    assert response["status"] == "succeeded"
+
+
+def test_cli_regular_user_self_approval_rejected(runner: CliRunner, db_path):
+    """Test that regular user cannot approve their own task via CLI."""
+    start = (datetime.utcnow() - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+    end = (datetime.utcnow() + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S")
+
+    runner.invoke(cli, [
+        "--db", db_path,
+        "window", "create",
+        "--name", "regular-self-approve-win",
+        "--start", start,
+        "--end", end,
+        "--as-user", "admin_user",
+    ])
+
+    result = runner.invoke(cli, [
+        "--db", db_path,
+        "--format", "json",
+        "window", "list",
+    ])
+    windows = json.loads(result.output)
+    window_id = windows[0]["id"]
+
+    result = runner.invoke(cli, [
+        "--db", db_path,
+        "task", "create",
+        "--name", "regular-self-approve-task",
+        "--description", "test",
+        "--sql", "UPDATE ...",
+        "--window-id", str(window_id),
+        "--as-user", "approver_user",
+    ])
+    assert result.exit_code == 0, f"Task create failed: {result.output}"
+
+    result = runner.invoke(cli, [
+        "--db", db_path,
+        "--format", "json",
+        "task", "list",
+    ])
+    assert result.exit_code == 0, f"Task list failed: {result.output}"
+    tasks = json.loads(result.output)
+    task_id = tasks[0]["id"]
+
+    runner.invoke(cli, [
+        "--db", db_path,
+        "task", "submit", str(task_id),
+        "--as-user", "approver_user",
+    ])
+
+    result = runner.invoke(cli, [
+        "--db", db_path,
+        "--format", "json",
+        "task", "approve", str(task_id),
+        "--as-user", "approver_user",
+    ])
+    assert result.exit_code != 0
+    error = json.loads(result.output)
+    assert error["success"] is False
+    assert "cannot approve their own task" in error["error"]
+
+
+def test_cli_failed_rollback_audit_log(runner: CliRunner, db_path):
+    """Test that failed rollback writes audit log visible via audit list --task-id."""
+    start = (datetime.utcnow() - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+    end = (datetime.utcnow() + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S")
+
+    runner.invoke(cli, [
+        "--db", db_path,
+        "window", "create",
+        "--name", "failed-rollback-audit-win",
+        "--start", start,
+        "--end", end,
+        "--as-user", "admin_user",
+    ])
+
+    result = runner.invoke(cli, [
+        "--db", db_path,
+        "--format", "json",
+        "window", "list",
+    ])
+    windows = json.loads(result.output)
+    window_id = windows[0]["id"]
+
+    runner.invoke(cli, [
+        "--db", db_path,
+        "task", "create",
+        "--name", "failed-rollback-audit-task",
+        "--description", "test",
+        "--sql", "UPDATE ...",
+        "--rollback-sql", "UPDATE ...",
+        "--window-id", str(window_id),
+        "--as-user", "operator_user",
+    ])
+
+    result = runner.invoke(cli, [
+        "--db", db_path,
+        "--format", "json",
+        "task", "list",
+    ])
+    tasks = json.loads(result.output)
+    task_id = tasks[0]["id"]
+    initial_status = tasks[0]["status"]
+
+    result = runner.invoke(cli, [
+        "--db", db_path,
+        "--format", "json",
+        "audit", "list", "--task-id", str(task_id),
+    ])
+    assert result.exit_code == 0
+    initial_audits = json.loads(result.output)
+    initial_count = len(initial_audits)
+
+    result = runner.invoke(cli, [
+        "--db", db_path,
+        "--format", "json",
+        "task", "rollback", str(task_id),
+        "--as-user", "operator_user",
+    ])
+    assert result.exit_code != 0
+    error = json.loads(result.output)
+    assert error["success"] is False
+    assert "must be 'succeeded' or 'failed'" in error["error"]
+
+    result = runner.invoke(cli, [
+        "--db", db_path,
+        "--format", "json",
+        "task", "show", str(task_id),
+    ])
+    assert result.exit_code == 0
+    task = json.loads(result.output)
+    assert task["status"] == initial_status
+
+    result = runner.invoke(cli, [
+        "--db", db_path,
+        "--format", "json",
+        "audit", "list", "--task-id", str(task_id),
+    ])
+    assert result.exit_code == 0
+    audits = json.loads(result.output)
+    assert len(audits) == initial_count + 1
+
+    failed_audit = audits[-1]
+    assert failed_audit["action"] == "task_rollback_rejected"
+    assert failed_audit["actor"] == "operator_user"
+    assert failed_audit["old_status"] == initial_status
+    assert failed_audit["new_status"] == initial_status
+    assert "must be 'succeeded' or 'failed'" in (failed_audit["details"] or "")

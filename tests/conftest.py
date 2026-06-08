@@ -77,6 +77,12 @@ def export_service(db: Database) -> ExportImportService:
 
 
 @pytest.fixture
+def role_repo(db: Database) -> "RoleRepository":
+    from repair_cli.persistence import RoleRepository
+    return RoleRepository(db)
+
+
+@pytest.fixture
 def future_window(service: RepairService) -> MaintenanceWindow:
     """Create a maintenance window in the future."""
     start = datetime.utcnow() + timedelta(hours=24)

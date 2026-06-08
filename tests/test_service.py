@@ -251,3 +251,65 @@ def test_invalid_role_permissions(service, draft_task):
 
     with pytest.raises(ValidationError, match="does not have operator role"):
         service.submit_for_approval(draft_task2.id, "unknown_user")
+
+
+def test_admin_can_approve_own_task(service, active_window, role_repo):
+    """Test that admin users can approve their own created tasks."""
+    role_repo.set_role("admin_creator", Role.ADMIN)
+    task = service.create_task(RepairTask(
+        name="admin-self-approve",
+        description="Test admin self-approval",
+        created_by="admin_creator",
+        sql="UPDATE ...",
+        rollback_sql="UPDATE ...",
+        window_id=active_window.id,
+    ))
+    task = service.submit_for_approval(task.id, "admin_creator")
+    assert task.status == TaskStatus.PENDING_APPROVAL
+
+    task = service.approve_task(task.id, "admin_creator")
+    assert task.status == TaskStatus.APPROVED
+    assert task.approved_by == "admin_creator"
+
+
+def test_admin_can_execute_own_task(service, active_window, role_repo):
+    """Test that admin users can execute their own created tasks (full workflow)."""
+    role_repo.set_role("admin_creator", Role.ADMIN)
+    task = service.create_task(RepairTask(
+        name="admin-self-execute",
+        description="Test admin self-execution",
+        created_by="admin_creator",
+        sql="UPDATE ...",
+        rollback_sql="UPDATE ...",
+        window_id=active_window.id,
+    ))
+    task = service.submit_for_approval(task.id, "admin_creator")
+    task = service.approve_task(task.id, "admin_creator")
+
+    task = service.run_task(task.id, "admin_creator")
+    assert task.status == TaskStatus.SUCCEEDED
+    assert task.executed_by == "admin_creator"
+
+
+def test_failed_rollback_writes_audit_log(service, approved_task):
+    """Test that rollback before execution fails and writes audit log."""
+    initial_audits = service.audit_repo.list_by_task(approved_task.id)
+    initial_count = len(initial_audits)
+
+    initial_status = approved_task.status
+
+    with pytest.raises(ValidationError, match="must be 'succeeded' or 'failed'"):
+        service.rollback_task(approved_task.id, "operator_user")
+
+    refreshed = service.task_repo.get(approved_task.id)
+    assert refreshed.status == initial_status
+
+    audits = service.audit_repo.list_by_task(approved_task.id)
+    assert len(audits) == initial_count + 1
+
+    failed_audit = audits[-1]
+    assert failed_audit.action == "task_rollback_rejected"
+    assert failed_audit.actor == "operator_user"
+    assert failed_audit.old_status == initial_status.value
+    assert failed_audit.new_status == initial_status.value
+    assert "must be 'succeeded' or 'failed'" in (failed_audit.details or "")
