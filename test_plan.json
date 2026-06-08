@@ -1,0 +1,146 @@
+{
+  "version": "1.0",
+  "exported_at": "2026-06-08T02:25:57.696748",
+  "windows": [
+    {
+      "id": 1,
+      "name": "prod-window",
+      "description": "Production maintenance",
+      "start_time": "2026-06-08T01:25:41",
+      "end_time": "2026-06-08T07:25:41",
+      "created_by": "admin_user"
+    }
+  ],
+  "tasks": [
+    {
+      "id": 2,
+      "name": "self-test",
+      "description": "Self approve test",
+      "created_by": "approver_user",
+      "sql": "SELECT 1",
+      "rollback_sql": null,
+      "window_id": 1,
+      "window_name": "prod-window",
+      "status": "pending_approval",
+      "approved_by": null,
+      "approved_at": null,
+      "executed_at": null,
+      "executed_by": null,
+      "rollback_at": null,
+      "rollback_by": null,
+      "created_at": "2026-06-08T02:25:51.244381",
+      "updated_at": "2026-06-08T02:25:52.391354"
+    },
+    {
+      "id": 1,
+      "name": "fix-users",
+      "description": "Fix user emails",
+      "created_by": "operator_user",
+      "sql": "UPDATE users SET email = LOWER(email)",
+      "rollback_sql": "UPDATE users SET email = UPPER(email)",
+      "window_id": 1,
+      "window_name": "prod-window",
+      "status": "rollback_succeeded",
+      "approved_by": "approver_user",
+      "approved_at": "2026-06-08T02:25:46.661410",
+      "executed_at": "2026-06-08T02:25:48.472003",
+      "executed_by": "operator_user",
+      "rollback_at": "2026-06-08T02:25:55.520525",
+      "rollback_by": "operator_user",
+      "created_at": "2026-06-08T02:25:43.945125",
+      "updated_at": "2026-06-08T02:25:55.544172"
+    }
+  ],
+  "audit_logs": [
+    {
+      "id": 7,
+      "task_id": 2,
+      "action": "task_created",
+      "actor": "approver_user",
+      "old_status": null,
+      "new_status": "draft",
+      "details": "Task 'self-test' created",
+      "created_at": "2026-06-08T02:25:51.256063"
+    },
+    {
+      "id": 8,
+      "task_id": 2,
+      "action": "task_submitted",
+      "actor": "approver_user",
+      "old_status": "draft",
+      "new_status": "pending_approval",
+      "details": null,
+      "created_at": "2026-06-08T02:25:52.398962"
+    },
+    {
+      "id": 2,
+      "task_id": 1,
+      "action": "task_created",
+      "actor": "operator_user",
+      "old_status": null,
+      "new_status": "draft",
+      "details": "Task 'fix-users' created",
+      "created_at": "2026-06-08T02:25:43.961002"
+    },
+    {
+      "id": 3,
+      "task_id": 1,
+      "action": "task_submitted",
+      "actor": "operator_user",
+      "old_status": "draft",
+      "new_status": "pending_approval",
+      "details": null,
+      "created_at": "2026-06-08T02:25:45.151972"
+    },
+    {
+      "id": 4,
+      "task_id": 1,
+      "action": "task_approved",
+      "actor": "approver_user",
+      "old_status": "pending_approval",
+      "new_status": "approved",
+      "details": null,
+      "created_at": "2026-06-08T02:25:46.687795"
+    },
+    {
+      "id": 5,
+      "task_id": 1,
+      "action": "task_run_started",
+      "actor": "operator_user",
+      "old_status": "approved",
+      "new_status": "running",
+      "details": null,
+      "created_at": "2026-06-08T02:25:48.488797"
+    },
+    {
+      "id": 6,
+      "task_id": 1,
+      "action": "task_run_succeeded",
+      "actor": "operator_user",
+      "old_status": "running",
+      "new_status": "succeeded",
+      "details": "Executed: UPDATE users SET email = LOWER(email)...",
+      "created_at": "2026-06-08T02:25:48.508715"
+    },
+    {
+      "id": 9,
+      "task_id": 1,
+      "action": "task_rollback_started",
+      "actor": "operator_user",
+      "old_status": "succeeded",
+      "new_status": "rollback_running",
+      "details": null,
+      "created_at": "2026-06-08T02:25:55.532998"
+    },
+    {
+      "id": 10,
+      "task_id": 1,
+      "action": "task_rollback_succeeded",
+      "actor": "operator_user",
+      "old_status": "rollback_running",
+      "new_status": "rollback_succeeded",
+      "details": "Executed: UPDATE users SET email = UPPER(email)...",
+      "created_at": "2026-06-08T02:25:55.552106"
+    }
+  ]
+}

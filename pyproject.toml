@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "repair-cli"
+version = "0.1.0"
+description = "Data repair scheduling and approval CLI"
+requires-python = ">=3.9"
+dependencies = [
+    "click>=8.1.0",
+    "sqlalchemy>=2.0.25",
+    "tabulate>=0.9.0",
+    "pydantic>=2.0.0",
+    "python-dateutil>=2.8.0",
+]
+
+[project.scripts]
+repair = "repair_cli.cli:cli"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "ruff>=0.4.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

@@ -1,0 +1,2 @@
+[console_scripts]
+repair = repair_cli.cli:cli
