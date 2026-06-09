@@ -10,12 +10,14 @@ from dateutil import parser as date_parser
 from .models import (
     ApprovalPolicy,
     AuditLog,
+    ChecklistItem,
     MaintenanceWindow,
     RepairTask,
     TaskStatus,
 )
 from .persistence import (
     AuditRepository,
+    ChecklistRepository,
     Database,
     PolicyRepository,
     TaskRepository,
@@ -31,6 +33,7 @@ class ExportImportService:
         self.window_repo = WindowRepository(db)
         self.audit_repo = AuditRepository(db)
         self.policy_repo = PolicyRepository(db)
+        self.checklist_repo = ChecklistRepository(db)
 
     def _parse_datetime(self, value: Optional[str]) -> Optional[datetime]:
         if not value:
@@ -63,6 +66,7 @@ class ExportImportService:
             },
             "windows": [],
             "tasks": [],
+            "checklist_items": [],
             "audit_logs": [],
         }
 
@@ -96,6 +100,21 @@ class ExportImportService:
                 "created_at": t.created_at.isoformat(),
                 "updated_at": t.updated_at.isoformat(),
             })
+
+        for tid in all_task_ids:
+            checklist = self.checklist_repo.get_by_task(tid)
+            for item in checklist:
+                plan["checklist_items"].append({
+                    "id": item.id,
+                    "task_id": item.task_id,
+                    "name": item.name,
+                    "required": item.required,
+                    "completed": item.completed,
+                    "notes": item.notes,
+                    "updated_by": item.updated_by,
+                    "created_at": item.created_at.isoformat(),
+                    "updated_at": item.updated_at.isoformat(),
+                })
 
         for a in audits:
             plan["audit_logs"].append({
@@ -241,11 +260,82 @@ class ExportImportService:
                     code="invalid_task",
                 ))
 
+        import_task_map: Dict[int, str] = {}
+        for task_data in plan.get("tasks", []):
+            tid = task_data.get("id")
+            tname = task_data.get("name")
+            if tid is not None:
+                import_task_map[tid] = tname
+
+        existing_tasks = self.task_repo.list()
+        existing_task_names = {t.name for t in existing_tasks}
+
+        for checklist_data in plan.get("checklist_items", []):
+            task_id = checklist_data.get("task_id")
+            task_name = import_task_map.get(task_id)
+
+            if task_id is not None and task_id not in import_task_map:
+                if not any(t.id == task_id for t in existing_tasks):
+                    errors.append(ValidationError(
+                        f"Checklist item '{checklist_data.get('name')}' references non-existent task id {task_id}",
+                        code="checklist_task_not_found",
+                    ))
+
+            if task_name and task_name not in existing_task_names and task_name not in import_task_map.values():
+                errors.append(ValidationError(
+                    f"Checklist item '{checklist_data.get('name')}' references non-existent task '{task_name}'",
+                    code="checklist_task_not_found",
+                ))
+
+            try:
+                ChecklistItem(
+                    task_id=task_id or 0,
+                    name=checklist_data.get("name", ""),
+                    required=checklist_data.get("required", True),
+                    completed=checklist_data.get("completed", False),
+                )
+            except (ValueError, TypeError) as e:
+                errors.append(ValidationError(
+                    f"Invalid checklist item '{checklist_data.get('name')}': {e}",
+                    code="invalid_checklist_item",
+                ))
+
+        for checklist_data in plan.get("checklist_items", []):
+            task_id = checklist_data.get("task_id")
+            task_name = import_task_map.get(task_id)
+
+            found_local_task = None
+            if task_name:
+                for t in existing_tasks:
+                    if t.name == task_name:
+                        found_local_task = t
+                        break
+
+            if found_local_task:
+                local_checklist = self.checklist_repo.get_by_task(found_local_task.id)
+                import_items = {}
+                for ci in plan.get("checklist_items", []):
+                    if ci.get("task_id") == task_id or import_task_map.get(ci.get("task_id")) == task_name:
+                        import_items[ci.get("name")] = ci
+
+                for local_item in local_checklist:
+                    if local_item.name in import_items:
+                        import_item = import_items[local_item.name]
+                        if (local_item.required != import_item.get("required", True) or
+                                local_item.completed != import_item.get("completed", False)):
+                            errors.append(ValidationError(
+                                f"Checklist conflict for task '{task_name}', item '{local_item.name}': "
+                                f"local required={local_item.required}, completed={local_item.completed}; "
+                                f"imported required={import_item.get('required', True)}, completed={import_item.get('completed', False)}",
+                                code="checklist_conflict",
+                            ))
+
         return errors
 
     def import_plan(self, plan: Dict[str, Any], actor: str = "import") -> Dict[str, Any]:
         errors = self.validate_import_plan(plan)
-        non_policy_errors = [e for e in errors if e.code != "policy_conflict"]
+        non_policy_errors = [e for e in errors if e.code not in ("policy_conflict", "checklist_conflict")]
+        checklist_conflicts = [e for e in errors if e.code == "checklist_conflict"]
         if non_policy_errors:
             raise ValidationError(
                 f"Import validation failed with {len(non_policy_errors)} error(s): "
@@ -255,6 +345,7 @@ class ExportImportService:
 
         window_id_map: Dict[int, int] = {}
         task_id_map: Dict[int, int] = {}
+        checklist_imported = 0
 
         with self.db.session() as session:
             try:
@@ -320,21 +411,106 @@ class ExportImportService:
                         rollback_by=task_data.get("rollback_by"),
                     )
 
-                    created = self.task_repo.create(task)
-                    if task.status != TaskStatus.DRAFT:
-                        self.task_repo.update_fields(
-                            created.id,
-                            status=task.status.value,
-                            approved_by=task.approved_by,
-                            approved_at=task.approved_at,
-                            executed_at=task.executed_at,
-                            executed_by=task.executed_by,
-                            rollback_at=task.rollback_at,
-                            rollback_by=task.rollback_by,
-                        )
+                    existing_task = None
+                    for t in self.task_repo.list():
+                        if t.name == task.name:
+                            existing_task = t
+                            break
+
+                    if existing_task:
+                        created = existing_task
+                        if task.status != TaskStatus.DRAFT:
+                            self.task_repo.update_fields(
+                                existing_task.id,
+                                status=task.status.value,
+                                approved_by=task.approved_by,
+                                approved_at=task.approved_at,
+                                executed_at=task.executed_at,
+                                executed_by=task.executed_by,
+                                rollback_at=task.rollback_at,
+                                rollback_by=task.rollback_by,
+                            )
+                    else:
+                        created = self.task_repo.create(task)
+                        if task.status != TaskStatus.DRAFT:
+                            self.task_repo.update_fields(
+                                created.id,
+                                status=task.status.value,
+                                approved_by=task.approved_by,
+                                approved_at=task.approved_at,
+                                executed_at=task.executed_at,
+                                executed_by=task.executed_by,
+                                rollback_at=task.rollback_at,
+                                rollback_by=task.rollback_by,
+                            )
 
                     if old_id is not None:
                         task_id_map[old_id] = created.id
+
+                import_task_map: Dict[int, str] = {}
+                for task_data in plan.get("tasks", []):
+                    tid = task_data.get("id")
+                    tname = task_data.get("name")
+                    if tid is not None:
+                        import_task_map[tid] = tname
+
+                checklist_by_task: Dict[int, List[Dict[str, Any]]] = {}
+                for checklist_data in plan.get("checklist_items", []):
+                    old_task_id = checklist_data.get("task_id")
+                    if old_task_id not in checklist_by_task:
+                        checklist_by_task[old_task_id] = []
+                    checklist_by_task[old_task_id].append(checklist_data)
+
+                for old_task_id, items_data in checklist_by_task.items():
+                    task_name = import_task_map.get(old_task_id)
+
+                    new_task_id: Optional[int] = None
+                    if old_task_id is not None and old_task_id in task_id_map:
+                        new_task_id = task_id_map[old_task_id]
+                    elif task_name:
+                        for t in self.task_repo.list():
+                            if t.name == task_name:
+                                new_task_id = t.id
+                                break
+
+                    if new_task_id is None:
+                        raise ValidationError(
+                            f"Cannot resolve task for checklist items",
+                            code="task_resolution_failed",
+                        )
+
+                    existing_items = self.checklist_repo.get_by_task(new_task_id)
+                    existing_by_name = {item.name: item for item in existing_items}
+
+                    new_items: List[ChecklistItem] = []
+                    updated_count = 0
+
+                    for item_data in items_data:
+                        item_name = item_data.get("name", "")
+                        if item_name in existing_by_name:
+                            existing_item = existing_by_name[item_name]
+                            self.checklist_repo.update_item(
+                                item_id=existing_item.id,
+                                actor=actor,
+                                completed=item_data.get("completed", False),
+                                notes=item_data.get("notes"),
+                            )
+                            updated_count += 1
+                        else:
+                            new_items.append(ChecklistItem(
+                                task_id=new_task_id,
+                                name=item_name,
+                                required=item_data.get("required", True),
+                                completed=item_data.get("completed", False),
+                                notes=item_data.get("notes"),
+                                updated_by=item_data.get("updated_by", actor),
+                            ))
+
+                    if new_items:
+                        all_items = list(existing_items) + new_items
+                        created, _ = self.checklist_repo.set_items(new_task_id, all_items)
+                        checklist_imported += created
+                    checklist_imported += updated_count
 
                 for audit_data in plan.get("audit_logs", []):
                     old_task_id = audit_data.get("task_id")
@@ -367,14 +543,18 @@ class ExportImportService:
                 session.rollback()
                 raise
 
-        return {
+        result = {
             "windows_imported": len(plan.get("windows", [])),
             "tasks_imported": len(plan.get("tasks", [])),
+            "checklist_items_imported": checklist_imported,
             "audits_imported": len(plan.get("audit_logs", [])),
             "policy_imported": policy_imported,
             "window_id_map": window_id_map,
             "task_id_map": task_id_map,
         }
+        if checklist_conflicts:
+            result["checklist_conflicts"] = [e.message for e in checklist_conflicts]
+        return result
 
     def import_from_file(self, filepath: str, actor: str = "import") -> Dict[str, Any]:
         with open(filepath, "r", encoding="utf-8") as f:

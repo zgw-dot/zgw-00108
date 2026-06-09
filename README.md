@@ -21,16 +21,18 @@ The project is modularized into distinct layers:
 All data is stored in SQLite with the following tables:
 - `maintenance_windows` - Time windows for safe execution
 - `repair_tasks` - Repair tasks with full lifecycle tracking
+- `checklist_items` - Pre-execution checklist items for tasks
 - `audit_logs` - Immutable audit trail of all actions
 - `role_rules` - User-to-role mappings
 - `approval_policies` - Configurable approval policies (persisted across restarts)
 
 ## Default Roles
 
-Three default users are created on first run:
+Four default users are created on first run:
 - `admin_user` - Full admin access
 - `approver_user` - Can approve/reject tasks
 - `operator_user` - Can create, submit, run, and rollback tasks
+- `operator_user_2` - Second operator (for testing ownership checks)
 
 ## Installation
 
@@ -146,13 +148,13 @@ repair policy set --allow-admin-self-approval false --require-different-approver
 ### Export & Import
 
 ```bash
-# Export all tasks to a plan file (includes policy)
+# Export all tasks to a plan file (includes policy and checklist items)
 repair plan export plan.json
 
 # Export specific tasks
 repair plan export plan.json --task-id 1 --task-id 2
 
-# Validate import (dry run) - shows policy conflicts without modifying
+# Validate import (dry run) - shows conflicts without modifying
 repair plan import plan.json --dry-run
 
 # Import into a new database
@@ -160,6 +162,43 @@ repair --db new.db plan import plan.json --as-user alice
 
 # Import despite policy conflicts
 repair plan import plan.json --ignore-policy-conflict --as-user alice
+
+# Import despite checklist conflicts
+repair plan import plan.json --ignore-checklist-conflict --as-user alice
+```
+
+### Checklist Management
+
+Pre-execution checklists ensure operators confirm necessary items before submitting or running data repairs.
+
+```bash
+# Set checklist for a task (replaces existing items)
+repair task checklist set 1 \
+  --item "Verify backup exists:true" \
+  --item "Test SQL on staging:true" \
+  --item "Notify stakeholders:false" \
+  --as-user operator_user
+
+# Set checklist via JSON (full control over completed, notes, etc.)
+repair task checklist set 1 --json '[
+  {"name": "Verify backup exists", "required": true, "completed": false},
+  {"name": "Test SQL on staging", "required": true, "completed": true, "notes": "Tested on staging 2025-01-15", "updated_by": "operator_user"}
+]' --as-user operator_user
+
+# View checklist for a task (table format)
+repair task checklist view 1
+
+# View checklist for a task (JSON format)
+repair --format json task checklist view 1
+
+# Update a checklist item (mark complete, add notes)
+repair task checklist update 1 1 \
+  --completed true \
+  --notes "Backup verified at s3://backup/2025-01-15" \
+  --as-user operator_user
+
+# Update notes only
+repair task checklist update 1 1 --notes "Re-verified 2025-01-16" --as-user operator_user
 ```
 
 ### Output Formats
@@ -189,6 +228,8 @@ DRAFT → PENDING_APPROVAL → APPROVED → RUNNING → SUCCEEDED → ROLLBACK_R
 - **Window Lock**: Cannot modify window times if tasks are in active states
 - **Import References**: Tasks must reference existing windows during import
 - **Audit Logging**: All actions (including failed attempts and policy changes) are logged to the audit table with actor, action, status transitions, and reason.
+- **Checklist Required Items**: All required checklist items must be completed before submitting for approval or running a task.
+- **Checklist Permissions**: Operators can only update checklists for tasks they created. Admin can update any checklist. Approvers can view but not modify checklists.
 
 ### Approval Policy Configuration
 
@@ -232,6 +273,13 @@ pytest --cov=src/repair_cli --cov-report=term-missing
 - ✅ Conflict detection after config changes
 - ✅ JSON output stability
 - ✅ CLI command integration
+- ✅ Checklist CRUD operations (set, view, update)
+- ✅ Checklist persistence across restarts
+- ✅ Required checklist items block submit/run
+- ✅ Checklist permission enforcement (operator ownership, approver read-only)
+- ✅ Audit logging for failed checklist operations
+- ✅ Checklist export/import with conflict detection
+- ✅ Dry-run import does not persist checklist data
 
 ## Error Handling
 
@@ -271,13 +319,16 @@ All errors produce consistent output:
 | `task` | `reject` | Reject task |
 | `task` | `run` | Execute task |
 | `task` | `rollback` | Rollback task |
+| `task checklist` | `set` | Set checklist items for a task |
+| `task checklist` | `view` | View checklist for a task |
+| `task checklist` | `update` | Update a single checklist item |
 | `audit` | `list` | View audit logs |
 | `role` | `list` | List user roles |
 | `role` | `set` | Set user role |
 | `policy` | `view` | View current approval policy |
 | `policy` | `set` | Update approval policy (admin only) |
-| `plan` | `export` | Export plan to JSON (includes policy) |
-| `plan` | `import` | Import plan from JSON (with policy conflict detection) |
+| `plan` | `export` | Export plan to JSON (includes policy and checklist) |
+| `plan` | `import` | Import plan from JSON (with conflict detection) |
 
 ## Bug Fix Verification Commands
 
@@ -670,3 +721,387 @@ rm verify_policy_export.db verify_policy_import.db verify_policy_import2.db veri
 | `missing_policy_option` | `policy set` called without any policy options |
 | `self_approval_not_allowed` | User cannot approve own task per policy |
 | `self_rejection_not_allowed` | User cannot reject own task per policy |
+
+---
+
+## Pre-Execution Checklist Verification Commands
+
+### Fix 6: Full Checklist Workflow with Required Items Blocking
+
+```bash
+# 1. Setup: Create window and task
+repair --db verify_checklist.db window create \
+  --name "checklist-test-window" \
+  --description "Checklist workflow test" \
+  --start "-1h" --end "+3h" \
+  --as-user admin_user
+
+repair --db verify_checklist.db task create \
+  --name "checklist-test-task" \
+  --description "Test pre-execution checklist" \
+  --sql "UPDATE users SET email = LOWER(email)" \
+  --rollback-sql "UPDATE users SET email = UPPER(email)" \
+  --window-id 1 \
+  --as-user operator_user
+
+# 2. Set checklist with required items (using --item flags)
+repair --db verify_checklist.db task checklist set 1 \
+  --item "Verify backup exists:true" \
+  --item "Test SQL on staging:true" \
+  --item "Notify stakeholders:false" \
+  --as-user operator_user
+
+# 3. View checklist (table format)
+repair --db verify_checklist.db task checklist view 1
+
+# 4. View checklist (JSON format)
+repair --db verify_checklist.db --format json task checklist view 1
+
+# 5. Try to submit without completing required items (should fail)
+repair --db verify_checklist.db --format json task submit 1 --as-user operator_user
+
+# 6. Complete first required item
+repair --db verify_checklist.db task checklist update 1 1 \
+  --completed true \
+  --notes "Backup verified at s3://backup/2025-01-15" \
+  --as-user operator_user
+
+# 7. Try to submit again - still missing one required item (should fail)
+repair --db verify_checklist.db --format json task submit 1 --as-user operator_user
+
+# 8. Complete second required item
+repair --db verify_checklist.db task checklist update 1 2 \
+  --completed true \
+  --as-user operator_user
+
+# 9. Submit now succeeds
+repair --db verify_checklist.db --format json task submit 1 --as-user operator_user
+
+# 10. Approve and run
+repair --db verify_checklist.db task approve 1 --as-user approver_user
+repair --db verify_checklist.db task run 1 --as-user operator_user
+
+# 11. Verify checklist persistence across restart
+repair --db verify_checklist.db --format json task checklist view 1
+
+# 12. View audit logs for checklist operations
+repair --db verify_checklist.db --format json audit list --task-id 1
+
+# Cleanup
+rm verify_checklist.db
+```
+
+**Expected JSON output - Step 4 (View checklist):**
+```json
+[
+  {
+    "id": 1,
+    "task_id": 1,
+    "name": "Verify backup exists",
+    "required": true,
+    "completed": false,
+    "notes": null,
+    "updated_by": null,
+    "created_at": "2026-06-08 08:00:00 UTC",
+    "updated_at": "2026-06-08 08:00:00 UTC"
+  },
+  {
+    "id": 2,
+    "task_id": 1,
+    "name": "Test SQL on staging",
+    "required": true,
+    "completed": false,
+    "notes": null,
+    "updated_by": null,
+    "created_at": "2026-06-08 08:00:00 UTC",
+    "updated_at": "2026-06-08 08:00:00 UTC"
+  },
+  {
+    "id": 3,
+    "task_id": 1,
+    "name": "Notify stakeholders",
+    "required": false,
+    "completed": false,
+    "notes": null,
+    "updated_by": null,
+    "created_at": "2026-06-08 08:00:00 UTC",
+    "updated_at": "2026-06-08 08:00:00 UTC"
+  }
+]
+```
+
+**Expected error JSON - Step 5 (Submit blocked by incomplete required items):**
+```json
+{
+  "success": false,
+  "error": "Cannot submit task 1: required checklist items not completed: 'Verify backup exists', 'Test SQL on staging'",
+  "code": "checklist_incomplete"
+}
+```
+
+**Expected success JSON - Step 6 (Update checklist item):**
+```json
+{
+  "success": true,
+  "message": "Checklist item updated",
+  "item": {
+    "id": 1,
+    "task_id": 1,
+    "name": "Verify backup exists",
+    "required": true,
+    "completed": true,
+    "notes": "Backup verified at s3://backup/2025-01-15",
+    "updated_by": "operator_user",
+    "created_at": "2026-06-08 08:00:00 UTC",
+    "updated_at": "2026-06-08 08:01:00 UTC"
+  }
+}
+```
+
+**Expected error JSON - Step 7 (Submit still blocked by 1 incomplete item):**
+```json
+{
+  "success": false,
+  "error": "Cannot submit task 1: required checklist items not completed: 'Test SQL on staging'",
+  "code": "checklist_incomplete"
+}
+```
+
+---
+
+### Fix 7: Checklist Permission Enforcement and Audit Logging
+
+```bash
+# 1. Setup: Create window and task as operator_user
+repair --db verify_checklist_perms.db window create \
+  --name "perm-test-window" --start "-1h" --end "+3h" --as-user admin_user
+
+repair --db verify_checklist_perms.db task create \
+  --name "perm-test-task" --description "Test" --sql "SELECT 1" --rollback-sql "SELECT 1" \
+  --window-id 1 --as-user operator_user
+
+repair --db verify_checklist_perms.db task checklist set 1 \
+  --item "Check backup:true" --as-user operator_user
+
+# 2. operator_user_2 (different operator) tries to update (should fail - not owner)
+repair --db verify_checklist_perms.db --format json task checklist update 1 1 \
+  --completed true --as-user operator_user_2
+
+# 3. approver_user tries to update (should fail - read-only)
+repair --db verify_checklist_perms.db --format json task checklist update 1 1 \
+  --completed true --as-user approver_user
+
+# 4. approver_user CAN view the checklist
+repair --db verify_checklist_perms.db --format json task checklist view 1 --as-user approver_user
+
+# 5. admin_user CAN update any checklist
+repair --db verify_checklist_perms.db --format json task checklist update 1 1 \
+  --completed true --as-user admin_user
+
+# 6. View audit logs - should show denied attempts
+repair --db verify_checklist_perms.db --format json audit list --task-id 1
+
+# Cleanup
+rm verify_checklist_perms.db
+```
+
+**Expected error JSON - Step 2 (Not owner):**
+```json
+{
+  "success": false,
+  "error": "User 'operator_user_2' cannot update checklist for task created by 'operator_user'",
+  "code": "checklist_not_owner"
+}
+```
+
+**Expected error JSON - Step 3 (Approver cannot modify):**
+```json
+{
+  "success": false,
+  "error": "User 'approver_user' does not have operator role to update checklist",
+  "code": "checklist_permission_denied"
+}
+```
+
+**Expected audit log entries (Step 6):**
+```json
+[
+  {
+    "id": 1,
+    "task_id": 1,
+    "action": "checklist_set",
+    "actor": "operator_user",
+    "old_status": "draft",
+    "new_status": "draft",
+    "details": "Checklist set for task 1: 1 items created",
+    "created_at": "2026-06-08 08:00:00 UTC"
+  },
+  {
+    "id": 2,
+    "task_id": 1,
+    "action": "checklist_update_denied",
+    "actor": "operator_user_2",
+    "old_status": "draft",
+    "new_status": "draft",
+    "details": "User 'operator_user_2' is not the owner of task 1 and cannot modify its checklist (created_by=operator_user)",
+    "created_at": "2026-06-08 08:01:00 UTC"
+  },
+  {
+    "id": 3,
+    "task_id": 1,
+    "action": "checklist_update_denied",
+    "actor": "approver_user",
+    "old_status": "draft",
+    "new_status": "draft",
+    "details": "User 'approver_user' does not have permission to modify checklist items (role=approver)",
+    "created_at": "2026-06-08 08:02:00 UTC"
+  },
+  {
+    "id": 4,
+    "task_id": 1,
+    "action": "checklist_updated",
+    "actor": "admin_user",
+    "old_status": "draft",
+    "new_status": "draft",
+    "details": "Checklist item 1 updated: completed=True, notes=None",
+    "created_at": "2026-06-08 08:03:00 UTC"
+  }
+]
+```
+
+---
+
+### Fix 8: Checklist Export/Import with Conflict Detection
+
+```bash
+# 1. Setup: Create window, task, and checklist
+repair --db verify_checklist_export.db window create \
+  --name "export-test-window" --start "-1h" --end "+3h" --as-user admin_user
+
+repair --db verify_checklist_export.db task create \
+  --name "export-test-task" --description "test" --sql "SELECT 1" --rollback-sql "SELECT 1" \
+  --window-id 1 --as-user operator_user
+
+repair --db verify_checklist_export.db task checklist set 1 \
+  --item "Verify backup:true" \
+  --item "Test SQL:true" \
+  --as-user operator_user
+
+repair --db verify_checklist_export.db task checklist update 1 1 \
+  --completed true --notes "Backup verified" --as-user operator_user
+
+# 2. Export plan (includes checklist)
+repair --db verify_checklist_export.db plan export checklist_plan.json
+
+# 3. View exported checklist in file
+python -c "import json; plan=json.load(open('checklist_plan.json', encoding='utf-8')); print(json.dumps(plan['checklist_items'], indent=2))"
+
+# 4. Import to new database (works fine)
+repair --db verify_checklist_import.db --format json plan import checklist_plan.json --as-user importer
+
+# 5. Mark imported checklist item as incomplete locally to create conflict
+repair --db verify_checklist_import.db task checklist update 1 1 \
+  --completed false --as-user importer
+
+# 6. Dry-run re-import shows conflict
+repair --db verify_checklist_import.db --format json plan import checklist_plan.json --dry-run --as-user importer
+
+# 7. Actual re-import fails due to conflict
+repair --db verify_checklist_import.db --format json plan import checklist_plan.json --as-user importer
+
+# 8. Import with --ignore-checklist-conflict succeeds
+repair --db verify_checklist_import.db --format json plan import checklist_plan.json --ignore-checklist-conflict --as-user importer
+
+# 9. Verify dry-run never persisted changes
+repair --db verify_checklist_dry.db plan import checklist_plan.json --dry-run --as-user importer
+repair --db verify_checklist_dry.db --format json task checklist view 1 --as-user importer
+
+# Cleanup
+rm verify_checklist_export.db verify_checklist_import.db verify_checklist_dry.db checklist_plan.json
+```
+
+**Expected JSON output - Step 3 (Exported checklist):**
+```json
+[
+  {
+    "id": 1,
+    "task_id": 1,
+    "name": "Verify backup",
+    "required": true,
+    "completed": true,
+    "notes": "Backup verified",
+    "updated_by": "operator_user",
+    "created_at": "2026-06-08T08:00:00",
+    "updated_at": "2026-06-08T08:01:00"
+  },
+  {
+    "id": 2,
+    "task_id": 1,
+    "name": "Test SQL",
+    "required": true,
+    "completed": false,
+    "notes": null,
+    "updated_by": null,
+    "created_at": "2026-06-08T08:00:00",
+    "updated_at": "2026-06-08T08:00:00"
+  }
+]
+```
+
+**Expected JSON output - Step 6 (Dry-run shows checklist conflict):**
+```json
+{
+  "success": true,
+  "message": "Import validation passed (dry run)",
+  "windows_to_import": 1,
+  "tasks_to_import": 1,
+  "audits_to_import": 3,
+  "checklist_items_to_import": 2,
+  "policy_to_import": {
+    "allow_admin_self_approval": true,
+    "require_different_approver": true,
+    "updated_by": null,
+    "updated_at": "2026-06-08T08:00:00"
+  },
+  "checklist_conflicts": [
+    "Checklist conflict for task 'export-test-task', item 'Verify backup': local required=True, completed=False; imported required=True, completed=True"
+  ],
+  "dry_run": true,
+  "note": "Use --ignore-checklist-conflict to import despite conflicts"
+}
+```
+
+**Expected error JSON - Step 7 (Checklist conflict blocks import):**
+```json
+{
+  "success": false,
+  "error": "Checklist conflict detected. Use --ignore-checklist-conflict to proceed. Checklist conflict for task 'export-test-task', item 'Verify backup': local required=True, completed=False; imported required=True, completed=True",
+  "code": "checklist_conflict"
+}
+```
+
+**Expected error JSON - Step 9 (Dry-run DB has no checklist data):**
+```json
+{
+  "success": false,
+  "error": "Task 1 not found",
+  "code": "task_not_found"
+}
+```
+
+### Checklist Error Code Reference
+
+| Error Code | Description |
+|------------|-------------|
+| `checklist_permission_denied` | User lacks operator/admin role to modify checklist |
+| `checklist_not_owner` | Operator is not the task owner and cannot modify checklist |
+| `checklist_incomplete` | Required checklist items are not completed |
+| `checklist_item_not_found` | Checklist item ID does not exist |
+| `checklist_item_mismatch` | Checklist item belongs to a different task |
+| `invalid_checklist_item` | Checklist item data is invalid (e.g., empty name) |
+| `checklist_view_denied` | User lacks permission to view checklist |
+| `checklist_conflict` | Imported checklist differs from local checklist |
+| `checklist_task_not_found` | Imported checklist references non-existent task |
+| `missing_checklist_items` | `checklist set` called without any items |
+| `missing_update_option` | `checklist update` called without --completed or --notes |
+

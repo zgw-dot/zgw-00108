@@ -8,6 +8,9 @@ from typing import Callable, Optional, Tuple
 from .models import (
     ApprovalPolicy,
     AuditLog,
+    ChecklistItem,
+    ChecklistSetResult,
+    ChecklistUpdateResult,
     MaintenanceWindow,
     PolicyUpdateResult,
     RepairTask,
@@ -16,6 +19,7 @@ from .models import (
 )
 from .persistence import (
     AuditRepository,
+    ChecklistRepository,
     Database,
     PolicyRepository,
     RoleRepository,
@@ -33,6 +37,7 @@ class RepairService:
         self.audit_repo = AuditRepository(db)
         self.role_repo = RoleRepository(db)
         self.policy_repo = PolicyRepository(db)
+        self.checklist_repo = ChecklistRepository(db)
         self.validator = Validator(
             self.task_repo,
             self.window_repo,
@@ -375,3 +380,251 @@ class RepairService:
             new_policy=new_policy,
             changed_fields=changed_fields,
         )
+
+    def _can_modify_checklist(self, task_id: int, actor: str) -> RepairTask:
+        task = self.task_repo.get(task_id)
+        if not task:
+            raise ValidationError(f"Task {task_id} not found", code="task_not_found")
+
+        user_role = self.role_repo.get_role(actor)
+        if user_role not in (Role.OPERATOR, Role.ADMIN):
+            self._audit(
+                task_id=task_id,
+                action="checklist_update_denied",
+                actor=actor,
+                details=f"User '{actor}' attempted to update checklist without operator permission",
+            )
+            raise ValidationError(
+                f"User '{actor}' does not have operator role to update checklist",
+                code="checklist_permission_denied",
+            )
+
+        if task.created_by != actor and user_role != Role.ADMIN:
+            self._audit(
+                task_id=task_id,
+                action="checklist_update_denied",
+                actor=actor,
+                details=f"User '{actor}' attempted to update checklist for task created by '{task.created_by}'",
+            )
+            raise ValidationError(
+                f"User '{actor}' cannot update checklist for task created by '{task.created_by}'",
+                code="checklist_not_owner",
+            )
+
+        return task
+
+    def set_checklist(self, task_id: int, items: list[ChecklistItem], actor: str) -> ChecklistSetResult:
+        self._can_modify_checklist(task_id, actor)
+
+        for item in items:
+            if not item.name or not item.name.strip():
+                raise ValidationError("Checklist item name cannot be empty", code="invalid_checklist_item")
+
+        created, updated = self.checklist_repo.set_items(task_id, items)
+
+        self._audit(
+            task_id=task_id,
+            action="checklist_set",
+            actor=actor,
+            details=f"Checklist set: {created} created, {updated} updated. Items: {[i.name for i in items]}",
+        )
+
+        return ChecklistSetResult(
+            task_id=task_id,
+            items_created=created,
+            items_updated=updated,
+        )
+
+    def get_checklist(self, task_id: int, actor: str) -> list[ChecklistItem]:
+        task = self.task_repo.get(task_id)
+        if not task:
+            raise ValidationError(f"Task {task_id} not found", code="task_not_found")
+
+        user_role = self.role_repo.get_role(actor)
+        if user_role not in (Role.OPERATOR, Role.APPROVER, Role.ADMIN):
+            self._audit(
+                task_id=task_id,
+                action="checklist_view_denied",
+                actor=actor,
+                details=f"User '{actor}' does not have permission to view checklist (role={user_role})",
+            )
+            raise ValidationError(
+                f"User '{actor}' does not have permission to view checklist",
+                code="checklist_view_denied",
+            )
+
+        return self.checklist_repo.get_by_task(task_id)
+
+    def update_checklist_item(
+        self,
+        task_id: int,
+        item_id: int,
+        actor: str,
+        completed: Optional[bool] = None,
+        notes: Optional[str] = None,
+    ) -> ChecklistUpdateResult:
+        task = self._can_modify_checklist(task_id, actor)
+
+        item = self.checklist_repo.get(item_id)
+        if not item:
+            self._audit(
+                task_id=task_id,
+                action="checklist_update_failed",
+                actor=actor,
+                details=f"Checklist item {item_id} not found",
+            )
+            raise ValidationError(f"Checklist item {item_id} not found", code="checklist_item_not_found")
+
+        if item.task_id != task_id:
+            self._audit(
+                task_id=task_id,
+                action="checklist_update_failed",
+                actor=actor,
+                details=f"Checklist item {item_id} does not belong to task {task_id}",
+            )
+            raise ValidationError(
+                f"Checklist item {item_id} does not belong to task {task_id}",
+                code="checklist_item_mismatch",
+            )
+
+        old_completed = item.completed
+        new_completed = completed if completed is not None else old_completed
+
+        updated = self.checklist_repo.update_item(
+            item_id=item_id,
+            actor=actor,
+            completed=completed,
+            notes=notes,
+        )
+
+        if not updated:
+            self._audit(
+                task_id=task_id,
+                action="checklist_update_failed",
+                actor=actor,
+                details=f"Concurrent modification when updating checklist item {item_id}",
+            )
+            raise ValidationError(
+                f"Checklist item {item_id} changed during update",
+                code="concurrent_modification",
+            )
+
+        actual_old = getattr(updated, '_old_completed', old_completed)
+        actual_new = updated.completed
+
+        changes = []
+        if completed is not None and actual_old != actual_new:
+            changes.append(f"completed: {actual_old} -> {actual_new}")
+        if notes is not None:
+            changes.append(f"notes updated")
+
+        self._audit(
+            task_id=task_id,
+            action="checklist_updated",
+            actor=actor,
+            details=f"Checklist item '{item.name}' updated: {', '.join(changes) if changes else 'no changes'}",
+        )
+
+        return ChecklistUpdateResult(
+            task_id=task_id,
+            item_id=item_id,
+            old_value=actual_old,
+            new_value=actual_new,
+            updated_by=actor,
+        )
+
+    def _validate_checklist_required(self, task_id: int, action: str) -> None:
+        incomplete = self.checklist_repo.get_incomplete_required(task_id)
+        if incomplete:
+            names = [f"'{i.name}'" for i in incomplete]
+            raise ValidationError(
+                f"Cannot {action} task {task_id}: required checklist items not completed: {', '.join(names)}",
+                code="checklist_incomplete",
+            )
+
+    def submit_for_approval(self, task_id: int, actor: str) -> RepairTask:
+        task = self.validator.validate_submit_for_approval(task_id, actor)
+        self._validate_checklist_required(task_id, "submit")
+        old_status = task.status.value
+        updated = self.task_repo.update_status(
+            task_id,
+            old_status=task.status,
+            new_status=TaskStatus.PENDING_APPROVAL,
+        )
+        if not updated:
+            raise ValidationError(
+                f"Task {task_id} status changed during validation",
+                code="concurrent_modification",
+            )
+        self._audit(
+            task_id=task_id,
+            action="task_submitted",
+            actor=actor,
+            old_status=old_status,
+            new_status=TaskStatus.PENDING_APPROVAL.value,
+        )
+        return updated
+
+    def run_task(self, task_id: int, actor: str) -> RepairTask:
+        task = self.validator.validate_run(task_id, actor)
+        self._validate_checklist_required(task_id, "run")
+        old_status = task.status.value
+        now = datetime.utcnow()
+
+        updated = self.task_repo.update_status(
+            task_id,
+            old_status=task.status,
+            new_status=TaskStatus.RUNNING,
+            executed_by=actor,
+        )
+        if not updated:
+            raise ValidationError(
+                f"Task {task_id} status changed during validation",
+                code="concurrent_modification",
+            )
+        self._audit(
+            task_id=task_id,
+            action="task_run_started",
+            actor=actor,
+            old_status=old_status,
+            new_status=TaskStatus.RUNNING.value,
+        )
+
+        try:
+            success, result = self.sql_executor(task.sql)
+            if success:
+                final_status = TaskStatus.SUCCEEDED
+                action = "task_run_succeeded"
+            else:
+                final_status = TaskStatus.FAILED
+                action = "task_run_failed"
+
+            updated = self.task_repo.update_fields(
+                task_id,
+                status=final_status.value,
+                executed_at=now,
+            )
+            self._audit(
+                task_id=task_id,
+                action=action,
+                actor=actor,
+                old_status=TaskStatus.RUNNING.value,
+                new_status=final_status.value,
+                details=result,
+            )
+            return updated
+        except Exception as e:
+            updated = self.task_repo.update_fields(
+                task_id,
+                status=TaskStatus.FAILED.value,
+                executed_at=now,
+            )
+            self._audit(
+                task_id=task_id,
+                action="task_run_failed",
+                actor=actor,
+                old_status=TaskStatus.RUNNING.value,
+                new_status=TaskStatus.FAILED.value,
+                details=str(e),
+            )
+            raise

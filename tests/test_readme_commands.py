@@ -297,3 +297,475 @@ class TestReadmeCommands:
         # Should be valid JSON
         windows = json.loads(result.stdout)
         assert isinstance(windows, list)
+
+    def test_checklist_full_workflow(self, temp_dir):
+        """Test full checklist workflow with required items blocking from README.
+
+        Verifies:
+        - Set checklist with --item flags
+        - View checklist (JSON format)
+        - Submit blocked by incomplete required items
+        - Update checklist items (mark complete, add notes)
+        - Submit succeeds after all required items complete
+        - Approve and run succeed
+        - Checklist persists across connections
+        - Audit logs recorded for all operations
+        """
+        db_path = os.path.join(temp_dir, "verify_checklist.db")
+        start = (datetime.utcnow() - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+        end = (datetime.utcnow() + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S")
+
+        # 1. Create window and task
+        result = run_command([
+            "--db", db_path,
+            "window", "create",
+            "--name", "checklist-test-window",
+            "--description", "Checklist workflow test",
+            "--start", start,
+            "--end", end,
+            "--as-user", "admin_user",
+        ])
+        assert result.returncode == 0, f"Window create failed: {result.stderr}"
+
+        result = run_command([
+            "--db", db_path,
+            "task", "create",
+            "--name", "checklist-test-task",
+            "--description", "Test pre-execution checklist",
+            "--sql", "UPDATE users SET email = LOWER(email)",
+            "--rollback-sql", "UPDATE users SET email = UPPER(email)",
+            "--window-id", "1",
+            "--as-user", "operator_user",
+        ])
+        assert result.returncode == 0, f"Task create failed: {result.stderr}"
+
+        # 2. Set checklist with required items
+        result = run_command([
+            "--db", db_path,
+            "task", "checklist", "set", "1",
+            "--item", "Verify backup exists:true",
+            "--item", "Test SQL on staging:true",
+            "--item", "Notify stakeholders:false",
+            "--as-user", "operator_user",
+        ])
+        assert result.returncode == 0, f"Checklist set failed: {result.stderr}"
+
+        # 3. View checklist (JSON format)
+        result = run_command([
+            "--db", db_path,
+            "--format", "json",
+            "task", "checklist", "view", "1",
+        ])
+        assert result.returncode == 0, f"Checklist view failed: {result.stderr}"
+        checklist = json.loads(result.stdout)
+        assert len(checklist) == 3
+        assert checklist[0]["name"] == "Verify backup exists"
+        assert checklist[0]["required"] is True
+        assert checklist[0]["completed"] is False
+        assert checklist[2]["name"] == "Notify stakeholders"
+        assert checklist[2]["required"] is False
+
+        # 4. Try to submit without completing required items (should fail)
+        result = run_command([
+            "--db", db_path,
+            "--format", "json",
+            "task", "submit", "1",
+            "--as-user", "operator_user",
+        ])
+        assert result.returncode != 0, "Submit should have failed"
+        error = json.loads(result.stderr)
+        assert error["success"] is False
+        assert error["code"] == "checklist_incomplete"
+        assert "required checklist items not completed" in error["error"]
+        assert "Verify backup exists" in error["error"]
+        assert "Test SQL on staging" in error["error"]
+
+        # 5. Complete first required item with notes
+        result = run_command([
+            "--db", db_path,
+            "--format", "json",
+            "task", "checklist", "update", "1", "1",
+            "--completed", "true",
+            "--notes", "Backup verified at s3://backup/2025-01-15",
+            "--as-user", "operator_user",
+        ])
+        assert result.returncode == 0, f"Checklist update failed: {result.stderr}"
+        update_result = json.loads(result.stdout)
+        assert update_result["success"] is True
+        assert update_result["item"]["completed"] is True
+        assert update_result["item"]["notes"] == "Backup verified at s3://backup/2025-01-15"
+        assert update_result["item"]["updated_by"] == "operator_user"
+
+        # 6. Try to submit again - still missing one required item (should fail)
+        result = run_command([
+            "--db", db_path,
+            "--format", "json",
+            "task", "submit", "1",
+            "--as-user", "operator_user",
+        ])
+        assert result.returncode != 0, "Submit should have failed"
+        error = json.loads(result.stderr)
+        assert error["code"] == "checklist_incomplete"
+        assert "required checklist items not completed" in error["error"]
+        assert "Test SQL on staging" in error["error"]
+        assert "Verify backup exists" not in error["error"]
+
+        # 7. Complete second required item
+        result = run_command([
+            "--db", db_path,
+            "task", "checklist", "update", "1", "2",
+            "--completed", "true",
+            "--as-user", "operator_user",
+        ])
+        assert result.returncode == 0, f"Checklist update failed: {result.stderr}"
+
+        # 8. Submit now succeeds
+        result = run_command([
+            "--db", db_path,
+            "--format", "json",
+            "task", "submit", "1",
+            "--as-user", "operator_user",
+        ])
+        assert result.returncode == 0, f"Submit failed: {result.stderr}"
+        submit_result = json.loads(result.stdout)
+        assert submit_result["success"] is True
+        assert submit_result["status"] == "pending_approval"
+
+        # 9. Approve and run
+        result = run_command([
+            "--db", db_path,
+            "task", "approve", "1",
+            "--as-user", "approver_user",
+        ])
+        assert result.returncode == 0, f"Approve failed: {result.stderr}"
+
+        result = run_command([
+            "--db", db_path,
+            "task", "run", "1",
+            "--as-user", "operator_user",
+        ])
+        assert result.returncode == 0, f"Run failed: {result.stderr}"
+
+        # 10. Verify checklist persistence across restart
+        result = run_command([
+            "--db", db_path,
+            "--format", "json",
+            "task", "checklist", "view", "1",
+        ])
+        assert result.returncode == 0, f"Checklist view after restart failed: {result.stderr}"
+        checklist_after = json.loads(result.stdout)
+        assert checklist_after[0]["completed"] is True
+        assert checklist_after[1]["completed"] is True
+        assert checklist_after[0]["notes"] == "Backup verified at s3://backup/2025-01-15"
+
+        # 11. Verify audit logs for checklist operations
+        result = run_command([
+            "--db", db_path,
+            "--format", "json",
+            "audit", "list",
+            "--task-id", "1",
+        ])
+        assert result.returncode == 0, f"Audit list failed: {result.stderr}"
+        audits = json.loads(result.stdout)
+        actions = [a["action"] for a in audits]
+        assert "checklist_set" in actions
+        assert "checklist_updated" in actions
+
+    def test_checklist_permission_enforcement(self, temp_dir):
+        """Test checklist permission enforcement and audit logging from README.
+
+        Verifies:
+        - Non-owner operator cannot update checklist
+        - Approver cannot update checklist (read-only)
+        - Approver can view checklist
+        - Admin can update any checklist
+        - Failed operations are audited
+        """
+        db_path = os.path.join(temp_dir, "verify_checklist_perms.db")
+        start = (datetime.utcnow() - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+        end = (datetime.utcnow() + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S")
+
+        # 1. Setup: Create window and task as operator_user
+        result = run_command([
+            "--db", db_path,
+            "window", "create",
+            "--name", "perm-test-window",
+            "--start", start,
+            "--end", end,
+            "--as-user", "admin_user",
+        ])
+        assert result.returncode == 0, f"Window create failed: {result.stderr}"
+
+        result = run_command([
+            "--db", db_path,
+            "task", "create",
+            "--name", "perm-test-task",
+            "--description", "Test",
+            "--sql", "SELECT 1",
+            "--rollback-sql", "SELECT 1",
+            "--window-id", "1",
+            "--as-user", "operator_user",
+        ])
+        assert result.returncode == 0, f"Task create failed: {result.stderr}"
+
+        result = run_command([
+            "--db", db_path,
+            "task", "checklist", "set", "1",
+            "--item", "Check backup:true",
+            "--as-user", "operator_user",
+        ])
+        assert result.returncode == 0, f"Checklist set failed: {result.stderr}"
+
+        # 2. operator_user_2 (different operator) tries to update (should fail)
+        result = run_command([
+            "--db", db_path,
+            "--format", "json",
+            "task", "checklist", "update", "1", "1",
+            "--completed", "true",
+            "--as-user", "operator_user_2",
+        ])
+        assert result.returncode != 0, "Non-owner update should have failed"
+        error = json.loads(result.stderr)
+        assert error["code"] == "checklist_not_owner"
+        assert "cannot update checklist for task created by" in error["error"]
+        assert "operator_user" in error["error"]
+
+        # 3. approver_user tries to update (should fail)
+        result = run_command([
+            "--db", db_path,
+            "--format", "json",
+            "task", "checklist", "update", "1", "1",
+            "--completed", "true",
+            "--as-user", "approver_user",
+        ])
+        assert result.returncode != 0, "Approver update should have failed"
+        error = json.loads(result.stderr)
+        assert error["code"] == "checklist_permission_denied"
+        assert "does not have operator role to update checklist" in error["error"]
+
+        # 4. approver_user CAN view the checklist
+        result = run_command([
+            "--db", db_path,
+            "--format", "json",
+            "task", "checklist", "view", "1",
+            "--as-user", "approver_user",
+        ])
+        assert result.returncode == 0, "Approver view should work"
+        checklist = json.loads(result.stdout)
+        assert len(checklist) == 1
+
+        # 5. admin_user CAN update any checklist
+        result = run_command([
+            "--db", db_path,
+            "--format", "json",
+            "task", "checklist", "update", "1", "1",
+            "--completed", "true",
+            "--as-user", "admin_user",
+        ])
+        assert result.returncode == 0, "Admin update should work"
+        update_result = json.loads(result.stdout)
+        assert update_result["item"]["completed"] is True
+        assert update_result["item"]["updated_by"] == "admin_user"
+
+        # 6. Verify audit logs show denied attempts
+        result = run_command([
+            "--db", db_path,
+            "--format", "json",
+            "audit", "list",
+            "--task-id", "1",
+        ])
+        assert result.returncode == 0, f"Audit list failed: {result.stderr}"
+        audits = json.loads(result.stdout)
+        actions = [a["action"] for a in audits]
+        assert "checklist_set" in actions
+        assert "checklist_update_denied" in actions
+        assert "checklist_updated" in actions
+
+        # Verify there are two denied entries
+        denied_audits = [a for a in audits if a["action"] == "checklist_update_denied"]
+        assert len(denied_audits) == 2
+
+    def test_checklist_export_import(self, temp_dir):
+        """Test checklist export/import with conflict detection from README.
+
+        Verifies:
+        - Export includes checklist items with all fields
+        - Import to new database preserves checklist state
+        - Conflict detection works when local checklist differs
+        - Dry-run does not persist changes
+        - --ignore-checklist-conflict flag works
+        """
+        db_export = os.path.join(temp_dir, "verify_checklist_export.db")
+        db_import = os.path.join(temp_dir, "verify_checklist_import.db")
+        db_dry = os.path.join(temp_dir, "verify_checklist_dry.db")
+        plan_file = os.path.join(temp_dir, "checklist_plan.json")
+        start = (datetime.utcnow() - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+        end = (datetime.utcnow() + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S")
+
+        # 1. Setup: Create window, task, and checklist
+        result = run_command([
+            "--db", db_export,
+            "window", "create",
+            "--name", "export-test-window",
+            "--start", start,
+            "--end", end,
+            "--as-user", "admin_user",
+        ])
+        assert result.returncode == 0, f"Window create failed: {result.stderr}"
+
+        result = run_command([
+            "--db", db_export,
+            "task", "create",
+            "--name", "export-test-task",
+            "--description", "test",
+            "--sql", "SELECT 1",
+            "--rollback-sql", "SELECT 1",
+            "--window-id", "1",
+            "--as-user", "operator_user",
+        ])
+        assert result.returncode == 0, f"Task create failed: {result.stderr}"
+
+        result = run_command([
+            "--db", db_export,
+            "task", "checklist", "set", "1",
+            "--item", "Verify backup:true",
+            "--item", "Test SQL:true",
+            "--as-user", "operator_user",
+        ])
+        assert result.returncode == 0, f"Checklist set failed: {result.stderr}"
+
+        result = run_command([
+            "--db", db_export,
+            "task", "checklist", "update", "1", "1",
+            "--completed", "true",
+            "--notes", "Backup verified",
+            "--as-user", "operator_user",
+        ])
+        assert result.returncode == 0, f"Checklist update failed: {result.stderr}"
+
+        # 2. Export plan (includes checklist)
+        result = run_command([
+            "--db", db_export,
+            "plan", "export", plan_file,
+        ])
+        assert result.returncode == 0, f"Plan export failed: {result.stderr}"
+
+        # 3. Verify exported checklist in file
+        with open(plan_file, "r", encoding="utf-8") as f:
+            plan = json.load(f)
+        assert "checklist_items" in plan
+        assert len(plan["checklist_items"]) == 2
+        assert plan["checklist_items"][0]["name"] == "Verify backup"
+        assert plan["checklist_items"][0]["completed"] is True
+        assert plan["checklist_items"][0]["notes"] == "Backup verified"
+        assert plan["checklist_items"][0]["updated_by"] == "operator_user"
+        assert plan["checklist_items"][1]["name"] == "Test SQL"
+        assert plan["checklist_items"][1]["completed"] is False
+
+        # 4. Import to new database (works fine)
+        result = run_command([
+            "--db", db_import,
+            "--format", "json",
+            "plan", "import", plan_file,
+            "--as-user", "importer",
+        ])
+        assert result.returncode == 0, f"Plan import failed: {result.stderr}"
+        import_result = json.loads(result.stdout)
+        assert import_result["success"] is True
+        assert import_result["checklist_items_imported"] == 2
+
+        # Verify imported checklist (use admin_user which has default permissions)
+        result = run_command([
+            "--db", db_import,
+            "--format", "json",
+            "task", "checklist", "view", "1",
+            "--as-user", "admin_user",
+        ])
+        assert result.returncode == 0, f"Checklist view failed: {result.stderr}"
+        imported = json.loads(result.stdout)
+        assert len(imported) == 2
+        assert imported[0]["name"] == "Verify backup"
+        assert imported[0]["completed"] is True
+        assert imported[0]["notes"] == "Backup verified"
+
+        # 5. Mark imported checklist item as incomplete locally to create conflict
+        result = run_command([
+            "--db", db_import,
+            "task", "checklist", "update", "1", "1",
+            "--completed", "false",
+            "--as-user", "admin_user",
+        ])
+        assert result.returncode == 0, f"Checklist update failed: {result.stderr}"
+
+        # Modify the plan to use different window name and time to avoid window conflicts on re-import
+        with open(plan_file, "r", encoding="utf-8") as f:
+            plan_for_reimport = json.load(f)
+        plan_for_reimport["windows"][0]["name"] = "conflict-test-window"
+        far_future = (datetime.utcnow() + timedelta(days=365)).isoformat()
+        far_future_end = (datetime.utcnow() + timedelta(days=365, hours=2)).isoformat()
+        plan_for_reimport["windows"][0]["start_time"] = far_future
+        plan_for_reimport["windows"][0]["end_time"] = far_future_end
+        plan_for_reimport["tasks"][0]["window_name"] = "conflict-test-window"
+        with open(plan_file, "w", encoding="utf-8") as f:
+            json.dump(plan_for_reimport, f)
+
+        # 6. Dry-run re-import shows conflict
+        result = run_command([
+            "--db", db_import,
+            "--format", "json",
+            "plan", "import", plan_file,
+            "--dry-run",
+            "--as-user", "importer",
+        ])
+        assert result.returncode == 0, f"Dry-run import failed: {result.stderr}"
+        dry_run = json.loads(result.stdout)
+        assert dry_run["success"] is True
+        assert dry_run["dry_run"] is True
+        assert len(dry_run["checklist_conflicts"]) >= 1
+        assert "Verify backup" in dry_run["checklist_conflicts"][0]
+        assert "local required=True, completed=False" in dry_run["checklist_conflicts"][0]
+        assert "imported required=True, completed=True" in dry_run["checklist_conflicts"][0]
+
+        # 7. Actual re-import fails due to conflict
+        result = run_command([
+            "--db", db_import,
+            "--format", "json",
+            "plan", "import", plan_file,
+            "--as-user", "importer",
+        ])
+        assert result.returncode != 0, "Import should have failed due to conflict"
+        error = json.loads(result.stderr)
+        assert error["code"] == "checklist_conflict"
+        assert "Use --ignore-checklist-conflict to proceed" in error["error"]
+
+        # 8. Import with --ignore-checklist-conflict succeeds
+        result = run_command([
+            "--db", db_import,
+            "--format", "json",
+            "plan", "import", plan_file,
+            "--ignore-checklist-conflict",
+            "--as-user", "importer",
+        ])
+        assert result.returncode == 0, f"Import with ignore flag failed: {result.stderr}"
+        import_result = json.loads(result.stdout)
+        assert import_result["success"] is True
+        assert len(import_result["checklist_conflicts_resolved"]) >= 1
+
+        # 9. Verify dry-run never persisted changes
+        result = run_command([
+            "--db", db_dry,
+            "plan", "import", plan_file,
+            "--dry-run",
+            "--as-user", "importer",
+        ])
+        assert result.returncode == 0, f"Dry-run failed: {result.stderr}"
+
+        result = run_command([
+            "--db", db_dry,
+            "--format", "json",
+            "task", "checklist", "view", "1",
+            "--as-user", "admin_user",
+        ])
+        assert result.returncode != 0, "Dry-run should not have persisted data"
+        error = json.loads(result.stderr)
+        assert error["code"] == "task_not_found"

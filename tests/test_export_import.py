@@ -9,6 +9,7 @@ import pytest
 
 from repair_cli.export_import import ExportImportService
 from repair_cli.models import (
+    ChecklistItem,
     MaintenanceWindow,
     RepairTask,
     Role,
@@ -547,3 +548,386 @@ def test_imported_policy_affects_approval(export_service, service, active_window
             os.unlink(new_db_path)
         except OSError:
             pass
+
+
+def test_export_plan_includes_checklist(export_service, service, future_window, draft_task):
+    """Test that exported plan includes checklist items."""
+    items = [
+        ChecklistItem(task_id=draft_task.id, name="Verify backup", required=True),
+        ChecklistItem(task_id=draft_task.id, name="Test on staging", required=False),
+    ]
+    service.set_checklist(draft_task.id, items, "operator_user")
+
+    saved = service.get_checklist(draft_task.id, "operator_user")
+    service.update_checklist_item(
+        task_id=draft_task.id,
+        item_id=saved[0].id,
+        actor="operator_user",
+        completed=True,
+        notes="Backup verified",
+    )
+
+    plan = export_service.export_plan()
+    assert "checklist_items" in plan
+    assert len(plan["checklist_items"]) == 2
+
+    checklist_by_name = {c["name"]: c for c in plan["checklist_items"]}
+    assert "Verify backup" in checklist_by_name
+    assert checklist_by_name["Verify backup"]["required"] is True
+    assert checklist_by_name["Verify backup"]["completed"] is True
+    assert checklist_by_name["Verify backup"]["notes"] == "Backup verified"
+    assert checklist_by_name["Verify backup"]["updated_by"] == "operator_user"
+
+    assert "Test on staging" in checklist_by_name
+    assert checklist_by_name["Test on staging"]["required"] is False
+    assert checklist_by_name["Test on staging"]["completed"] is False
+
+
+def test_import_checklist_to_new_database(export_service, service, future_window, draft_task):
+    """Test that checklist is imported to a new database."""
+    items = [
+        ChecklistItem(task_id=draft_task.id, name="Verify backup", required=True),
+        ChecklistItem(task_id=draft_task.id, name="Test on staging", required=False),
+    ]
+    service.set_checklist(draft_task.id, items, "operator_user")
+
+    saved = service.get_checklist(draft_task.id, "operator_user")
+    service.update_checklist_item(
+        task_id=draft_task.id,
+        item_id=saved[0].id,
+        actor="operator_user",
+        completed=True,
+        notes="Done",
+    )
+
+    plan = export_service.export_plan()
+
+    fd, new_db_path = tempfile.mkstemp(suffix=".sqlite")
+    os.close(fd)
+    try:
+        new_db = Database(f"sqlite:///{new_db_path}")
+        new_db.init_db()
+        new_db.init_default_roles()
+        new_export = ExportImportService(new_db)
+        from repair_cli.service import RepairService
+        new_service = RepairService(new_db)
+
+        result = new_export.import_plan(plan, actor="importer")
+        assert result["checklist_items_imported"] == 2
+
+        imported_tasks = new_service.task_repo.list()
+        imported_task = next(t for t in imported_tasks if t.name == draft_task.name)
+
+        imported_checklist = new_service.get_checklist(imported_task.id, "operator_user")
+        assert len(imported_checklist) == 2
+
+        by_name = {c.name: c for c in imported_checklist}
+        assert by_name["Verify backup"].required is True
+        assert by_name["Verify backup"].completed is True
+        assert by_name["Verify backup"].notes == "Done"
+        assert by_name["Test on staging"].required is False
+        assert by_name["Test on staging"].completed is False
+    finally:
+        try:
+            os.unlink(new_db_path)
+        except OSError:
+            pass
+
+
+def test_import_checklist_conflict_detected(export_service, service, future_window, draft_task):
+    """Test that checklist conflict is detected during import validation."""
+    items = [
+        ChecklistItem(task_id=draft_task.id, name="Verify backup", required=True, completed=False),
+    ]
+    service.set_checklist(draft_task.id, items, "operator_user")
+
+    saved = service.get_checklist(draft_task.id, "operator_user")
+    service.update_checklist_item(
+        task_id=draft_task.id,
+        item_id=saved[0].id,
+        actor="operator_user",
+        completed=True,
+    )
+
+    plan = export_service.export_plan()
+
+    fd, new_db_path = tempfile.mkstemp(suffix=".sqlite")
+    os.close(fd)
+    try:
+        new_db = Database(f"sqlite:///{new_db_path}")
+        new_db.init_db()
+        new_db.init_default_roles()
+        new_export = ExportImportService(new_db)
+        from repair_cli.service import RepairService
+        new_service = RepairService(new_db)
+
+        new_export.import_plan(plan, actor="importer")
+
+        imported_tasks = new_service.task_repo.list()
+        imported_task = next(t for t in imported_tasks if t.name == draft_task.name)
+        imported_items = new_service.get_checklist(imported_task.id, "admin_user")
+        new_service.checklist_repo.update_item(
+            item_id=imported_items[0].id,
+            actor="local_user",
+            completed=False,
+        )
+
+        errors = new_export.validate_import_plan(plan)
+        checklist_conflicts = [e for e in errors if e.code == "checklist_conflict"]
+        assert len(checklist_conflicts) >= 1
+        assert "Verify backup" in checklist_conflicts[0].message
+        assert "completed=False" in checklist_conflicts[0].message
+        assert "completed=True" in checklist_conflicts[0].message
+    finally:
+        try:
+            os.unlink(new_db_path)
+        except OSError:
+            pass
+
+
+def test_import_checklist_dry_run_no_changes(export_service, service, future_window, draft_task):
+    """Test that dry run import does not modify checklist in database."""
+    from click.testing import CliRunner
+    from repair_cli.cli import cli
+
+    items = [
+        ChecklistItem(task_id=draft_task.id, name="Verify backup", required=True),
+    ]
+    service.set_checklist(draft_task.id, items, "operator_user")
+
+    fd, export_path = tempfile.mkstemp(suffix=".json")
+    os.close(fd)
+    try:
+        export_service.export_to_file(export_path)
+
+        fd, new_db_path = tempfile.mkstemp(suffix=".sqlite")
+        os.close(fd)
+        try:
+            runner = CliRunner()
+
+            result = runner.invoke(cli, [
+                "--db", new_db_path,
+                "--format", "json",
+                "plan", "import", export_path,
+                "--dry-run",
+                "--as-user", "importer",
+            ])
+            assert result.exit_code == 0, result.output
+            output = json.loads(result.output)
+            assert output["checklist_items_to_import"] == 1
+
+            new_db = Database(f"sqlite:///{new_db_path}")
+            new_db.init_db()
+            from repair_cli.service import RepairService
+            new_service = RepairService(new_db)
+
+            tasks = new_service.task_repo.list()
+            assert len(tasks) == 0
+        finally:
+            try:
+                os.unlink(new_db_path)
+            except OSError:
+                pass
+    finally:
+        try:
+            os.unlink(export_path)
+        except OSError:
+            pass
+
+
+def test_import_checklist_with_ignore_conflict_flag(export_service, service, future_window, draft_task):
+    """Test that --ignore-checklist-conflict flag allows proceeding with import."""
+    from click.testing import CliRunner
+    from repair_cli.cli import cli
+
+    items = [
+        ChecklistItem(task_id=draft_task.id, name="Verify backup", required=True),
+    ]
+    service.set_checklist(draft_task.id, items, "operator_user")
+
+    saved = service.get_checklist(draft_task.id, "operator_user")
+    service.update_checklist_item(
+        task_id=draft_task.id,
+        item_id=saved[0].id,
+        actor="operator_user",
+        completed=True,
+    )
+
+    fd, export_path = tempfile.mkstemp(suffix=".json")
+    os.close(fd)
+    try:
+        export_service.export_to_file(export_path)
+
+        fd, new_db_path = tempfile.mkstemp(suffix=".sqlite")
+        os.close(fd)
+        try:
+            new_db = Database(f"sqlite:///{new_db_path}")
+            new_db.init_db()
+            new_db.init_default_roles()
+            new_export = ExportImportService(new_db)
+            from repair_cli.service import RepairService
+            new_service = RepairService(new_db)
+
+            original_plan = export_service.export_plan()
+            new_export.import_plan(original_plan, actor="importer")
+
+            imported_tasks = new_service.task_repo.list()
+            imported_task = next(t for t in imported_tasks if t.name == draft_task.name)
+            imported_items = new_service.get_checklist(imported_task.id, "admin_user")
+            new_service.checklist_repo.update_item(
+                item_id=imported_items[0].id,
+                actor="local_user",
+                completed=False,
+            )
+
+            with open(export_path, "r", encoding="utf-8") as f:
+                plan_for_reimport = json.load(f)
+
+            plan_for_reimport["windows"][0]["name"] = "conflict-test-window"
+            from datetime import datetime, timedelta
+            far_future = (datetime.utcnow() + timedelta(days=365)).isoformat()
+            far_future_end = (datetime.utcnow() + timedelta(days=365, hours=2)).isoformat()
+            plan_for_reimport["windows"][0]["start_time"] = far_future
+            plan_for_reimport["windows"][0]["end_time"] = far_future_end
+            plan_for_reimport["tasks"][0]["window_name"] = "conflict-test-window"
+
+            with open(export_path, "w", encoding="utf-8") as f:
+                json.dump(plan_for_reimport, f, ensure_ascii=False)
+
+            runner = CliRunner()
+
+            result = runner.invoke(cli, [
+                "--db", new_db_path,
+                "--format", "json",
+                "plan", "import", export_path,
+                "--as-user", "importer",
+            ])
+            assert result.exit_code != 0, result.output
+            error = json.loads(result.output)
+            assert error["code"] == "checklist_conflict"
+
+            result = runner.invoke(cli, [
+                "--db", new_db_path,
+                "--format", "json",
+                "plan", "import", export_path,
+                "--ignore-checklist-conflict",
+                "--as-user", "importer",
+            ])
+            assert result.exit_code == 0, result.output
+
+            refreshed = new_service.get_checklist(imported_task.id, "admin_user")
+            assert refreshed[0].completed is True
+        finally:
+            try:
+                os.unlink(new_db_path)
+            except OSError:
+                pass
+    finally:
+        try:
+            os.unlink(export_path)
+        except OSError:
+            pass
+
+
+def test_checklist_persistence_imported(export_service, service, future_window, draft_task):
+    """Test that imported checklist persists across database reconnections."""
+    from repair_cli.persistence import Database
+    from repair_cli.service import RepairService
+
+    items = [
+        ChecklistItem(task_id=draft_task.id, name="Verify backup", required=True),
+    ]
+    service.set_checklist(draft_task.id, items, "operator_user")
+
+    saved = service.get_checklist(draft_task.id, "operator_user")
+    service.update_checklist_item(
+        task_id=draft_task.id,
+        item_id=saved[0].id,
+        actor="operator_user",
+        completed=True,
+        notes="Verified OK",
+    )
+
+    plan = export_service.export_plan()
+
+    fd, new_db_path = tempfile.mkstemp(suffix=".sqlite")
+    os.close(fd)
+    try:
+        new_db = Database(f"sqlite:///{new_db_path}")
+        new_db.init_db()
+        new_db.init_default_roles()
+        new_export = ExportImportService(new_db)
+        new_export.import_plan(plan, actor="importer")
+
+        reconnected_db = Database(f"sqlite:///{new_db_path}")
+        reconnected_db.init_db()
+        new_service = RepairService(reconnected_db)
+
+        imported_tasks = new_service.task_repo.list()
+        imported_task = next(t for t in imported_tasks if t.name == draft_task.name)
+
+        checklist = new_service.get_checklist(imported_task.id, "operator_user")
+        assert len(checklist) == 1
+        assert checklist[0].name == "Verify backup"
+        assert checklist[0].completed is True
+        assert checklist[0].notes == "Verified OK"
+        assert checklist[0].updated_by == "operator_user"
+    finally:
+        try:
+            os.unlink(new_db_path)
+        except OSError:
+            pass
+
+
+def test_import_invalid_checklist_item(export_service, service, future_window, draft_task):
+    """Test that invalid checklist items are rejected during import validation."""
+    items = [
+        ChecklistItem(task_id=draft_task.id, name="Valid item", required=True),
+    ]
+    service.set_checklist(draft_task.id, items, "operator_user")
+
+    plan = export_service.export_plan()
+
+    for c in plan["checklist_items"]:
+        c["task_id"] = 99999
+
+    errors = export_service.validate_import_plan(plan)
+    checklist_errors = [e for e in errors if e.code == "checklist_task_not_found"]
+    assert len(checklist_errors) >= 1
+
+
+def test_export_checklist_includes_all_fields(export_service, service, future_window, draft_task):
+    """Test that all checklist fields are included in export."""
+    items = [
+        ChecklistItem(task_id=draft_task.id, name="Full test", required=True),
+    ]
+    service.set_checklist(draft_task.id, items, "operator_user")
+
+    saved = service.get_checklist(draft_task.id, "operator_user")
+    service.update_checklist_item(
+        task_id=draft_task.id,
+        item_id=saved[0].id,
+        actor="operator_user",
+        completed=True,
+        notes="All fields test",
+    )
+
+    plan = export_service.export_plan()
+    checklist = plan["checklist_items"][0]
+
+    assert "id" in checklist
+    assert "task_id" in checklist
+    assert "name" in checklist
+    assert "required" in checklist
+    assert "completed" in checklist
+    assert "notes" in checklist
+    assert "updated_by" in checklist
+    assert "created_at" in checklist
+    assert "updated_at" in checklist
+
+    assert checklist["name"] == "Full test"
+    assert checklist["required"] is True
+    assert checklist["completed"] is True
+    assert checklist["notes"] == "All fields test"
+    assert checklist["updated_by"] == "operator_user"
+

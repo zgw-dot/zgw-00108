@@ -10,6 +10,7 @@ from tabulate import tabulate
 from .models import (
     ApprovalPolicy,
     AuditLog,
+    ChecklistItem,
     MaintenanceWindow,
     RepairTask,
     RoleRule,
@@ -130,6 +131,22 @@ def format_policy_table(policy: ApprovalPolicy) -> str:
     return tabulate(rows, headers=["Policy Setting", "Value"], tablefmt="grid")
 
 
+def format_checklist_table(items: List[ChecklistItem]) -> str:
+    rows = []
+    for item in items:
+        rows.append([
+            item.id,
+            "✓" if item.completed else " ",
+            "*" if item.required else " ",
+            item.name,
+            item.updated_by or "",
+            _format_datetime(item.updated_at),
+            (item.notes or "")[:60],
+        ])
+    headers = ["ID", "Done", "Req", "Name", "Updated By", "Updated At", "Notes"]
+    return tabulate(rows, headers=headers, tablefmt="grid")
+
+
 def _task_to_dict(task: RepairTask) -> Dict[str, Any]:
     return {
         "id": task.id,
@@ -196,6 +213,20 @@ def _policy_to_dict(policy: ApprovalPolicy) -> Dict[str, Any]:
     }
 
 
+def _checklist_to_dict(item: ChecklistItem) -> Dict[str, Any]:
+    return {
+        "id": item.id,
+        "task_id": item.task_id,
+        "name": item.name,
+        "required": item.required,
+        "completed": item.completed,
+        "notes": item.notes,
+        "updated_by": item.updated_by,
+        "created_at": _format_datetime(item.created_at),
+        "updated_at": _format_datetime(item.updated_at),
+    }
+
+
 def to_json(data: Any, indent: int = 2) -> str:
     if isinstance(data, list):
         items = []
@@ -208,6 +239,8 @@ def to_json(data: Any, indent: int = 2) -> str:
                 items.append(_audit_to_dict(item))
             elif isinstance(item, RoleRule):
                 items.append(_role_to_dict(item))
+            elif isinstance(item, ChecklistItem):
+                items.append(_checklist_to_dict(item))
             else:
                 items.append(item)
         return json.dumps(items, indent=indent, ensure_ascii=False)
@@ -221,6 +254,8 @@ def to_json(data: Any, indent: int = 2) -> str:
         return json.dumps(_role_to_dict(data), indent=indent, ensure_ascii=False)
     elif isinstance(data, ApprovalPolicy):
         return json.dumps(_policy_to_dict(data), indent=indent, ensure_ascii=False)
+    elif isinstance(data, ChecklistItem):
+        return json.dumps(_checklist_to_dict(data), indent=indent, ensure_ascii=False)
     else:
         return json.dumps(data, indent=indent, ensure_ascii=False)
 

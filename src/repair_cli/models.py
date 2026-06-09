@@ -105,6 +105,39 @@ class ApprovalPolicy(BaseModel):
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 
 
+class ChecklistItem(BaseModel):
+    id: Optional[int] = None
+    task_id: int
+    name: str
+    required: bool = True
+    completed: bool = False
+    notes: Optional[str] = None
+    updated_by: Optional[str] = None
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+    @field_validator("name")
+    @classmethod
+    def not_empty(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("Cannot be empty")
+        return v.strip()
+
+
+class ChecklistUpdateResult(BaseModel):
+    task_id: int
+    item_id: int
+    old_value: bool
+    new_value: bool
+    updated_by: str
+
+
+class ChecklistSetResult(BaseModel):
+    task_id: int
+    items_created: int
+    items_updated: int
+
+
 class PolicyUpdateResult(BaseModel):
     old_policy: ApprovalPolicy
     new_policy: ApprovalPolicy

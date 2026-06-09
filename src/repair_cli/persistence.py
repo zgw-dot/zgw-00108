@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session, declarative_base, relationship, sessionmaker
 from .models import (
     ApprovalPolicy as ApprovalPolicyModel,
     AuditLog as AuditLogModel,
+    ChecklistItem as ChecklistItemModel,
     MaintenanceWindow as MaintenanceWindowModel,
     RepairTask as RepairTaskModel,
     Role,
@@ -53,6 +54,7 @@ class RepairTask(Base):
 
     window = relationship("MaintenanceWindow", back_populates="tasks")
     audit_logs = relationship("AuditLog", back_populates="task")
+    checklist_items = relationship("ChecklistItem", back_populates="task", cascade="all, delete-orphan")
 
 
 class MaintenanceWindow(Base):
@@ -104,6 +106,22 @@ class ApprovalPolicy(Base):
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class ChecklistItem(Base):
+    __tablename__ = "checklist_items"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    task_id = Column(Integer, ForeignKey("repair_tasks.id"), nullable=False, index=True)
+    name = Column(String(255), nullable=False)
+    required = Column(Integer, nullable=False, default=1)
+    completed = Column(Integer, nullable=False, default=0)
+    notes = Column(Text)
+    updated_by = Column(String(255))
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    task = relationship("RepairTask", back_populates="checklist_items")
+
+
 class Database:
     def __init__(self, db_url: str = "sqlite:///repair.db"):
         self.engine = create_engine(db_url, echo=False, future=True)
@@ -129,6 +147,7 @@ class Database:
                 ("admin_user", Role.ADMIN),
                 ("approver_user", Role.APPROVER),
                 ("operator_user", Role.OPERATOR),
+                ("operator_user_2", Role.OPERATOR),
             ]
             for username, role in default_roles:
                 existing = session.query(RoleRule).filter(RoleRule.username == username).first()
@@ -213,6 +232,20 @@ def _to_policy_model(db_policy: ApprovalPolicy) -> ApprovalPolicyModel:
         require_different_approver=bool(db_policy.require_different_approver),
         updated_by=db_policy.updated_by,
         updated_at=db_policy.updated_at,
+    )
+
+
+def _to_checklist_model(db_item: ChecklistItem) -> ChecklistItemModel:
+    return ChecklistItemModel(
+        id=db_item.id,
+        task_id=db_item.task_id,
+        name=db_item.name,
+        required=bool(db_item.required),
+        completed=bool(db_item.completed),
+        notes=db_item.notes,
+        updated_by=db_item.updated_by,
+        created_at=db_item.created_at,
+        updated_at=db_item.updated_at,
     )
 
 
@@ -478,3 +511,119 @@ class PolicyRepository:
             session.commit()
             session.refresh(db_policy)
             return _to_policy_model(db_policy)
+
+
+class ChecklistRepository:
+    def __init__(self, db: Database):
+        self.db = db
+
+    def set_items(self, task_id: int, items: List[ChecklistItemModel]) -> Tuple[int, int]:
+        created = 0
+        updated = 0
+        with self.db.session() as session:
+            existing = session.query(ChecklistItem).filter(
+                ChecklistItem.task_id == task_id
+            ).all()
+            existing_by_name = {item.name: item for item in existing}
+
+            for item_data in items:
+                if item_data.name in existing_by_name:
+                    db_item = existing_by_name[item_data.name]
+                    changed = False
+                    if db_item.required != (1 if item_data.required else 0):
+                        db_item.required = 1 if item_data.required else 0
+                        changed = True
+                    if db_item.completed != (1 if item_data.completed else 0):
+                        db_item.completed = 1 if item_data.completed else 0
+                        changed = True
+                    if db_item.notes != item_data.notes:
+                        db_item.notes = item_data.notes
+                        changed = True
+                    if db_item.updated_by != item_data.updated_by:
+                        db_item.updated_by = item_data.updated_by
+                        changed = True
+                    if changed:
+                        db_item.updated_at = datetime.utcnow()
+                        updated += 1
+                    del existing_by_name[item_data.name]
+                else:
+                    db_item = ChecklistItem(
+                        task_id=task_id,
+                        name=item_data.name,
+                        required=1 if item_data.required else 0,
+                        completed=1 if item_data.completed else 0,
+                        notes=item_data.notes,
+                        updated_by=item_data.updated_by,
+                    )
+                    session.add(db_item)
+                    created += 1
+
+            for to_remove in existing_by_name.values():
+                session.delete(to_remove)
+
+            session.commit()
+        return created, updated
+
+    def get_by_task(self, task_id: int) -> List[ChecklistItemModel]:
+        with self.db.session() as session:
+            db_items = (
+                session.query(ChecklistItem)
+                .filter(ChecklistItem.task_id == task_id)
+                .order_by(ChecklistItem.id.asc())
+                .all()
+            )
+            return [_to_checklist_model(item) for item in db_items]
+
+    def get(self, item_id: int) -> Optional[ChecklistItemModel]:
+        with self.db.session() as session:
+            db_item = session.query(ChecklistItem).filter(ChecklistItem.id == item_id).first()
+            return _to_checklist_model(db_item) if db_item else None
+
+    def get_for_update(self, session: Session, item_id: int) -> Optional[ChecklistItem]:
+        return session.query(ChecklistItem).filter(ChecklistItem.id == item_id).with_for_update().first()
+
+    def update_item(
+        self,
+        item_id: int,
+        actor: str,
+        completed: Optional[bool] = None,
+        notes: Optional[str] = None,
+    ) -> Optional[ChecklistItemModel]:
+        with self.db.session() as session:
+            db_item = self.get_for_update(session, item_id)
+            if not db_item:
+                return None
+            old_completed = bool(db_item.completed)
+            if completed is not None:
+                db_item.completed = 1 if completed else 0
+            if notes is not None:
+                db_item.notes = notes
+            db_item.updated_by = actor
+            db_item.updated_at = datetime.utcnow()
+            session.commit()
+            session.refresh(db_item)
+            result = _to_checklist_model(db_item)
+            result._old_completed = old_completed
+            return result
+
+    def get_incomplete_required(self, task_id: int) -> List[ChecklistItemModel]:
+        with self.db.session() as session:
+            db_items = (
+                session.query(ChecklistItem)
+                .filter(
+                    ChecklistItem.task_id == task_id,
+                    ChecklistItem.required == 1,
+                    ChecklistItem.completed == 0,
+                )
+                .order_by(ChecklistItem.id.asc())
+                .all()
+            )
+            return [_to_checklist_model(item) for item in db_items]
+
+    def delete_by_task(self, task_id: int) -> int:
+        with self.db.session() as session:
+            count = session.query(ChecklistItem).filter(
+                ChecklistItem.task_id == task_id
+            ).delete()
+            session.commit()
+            return count

@@ -12,8 +12,10 @@ from dateutil import parser as date_parser
 
 from .export_import import ExportImportService
 from .formatters import (
+    _checklist_to_dict,
     error_response,
     format_audit_table,
+    format_checklist_table,
     format_output,
     format_policy_table,
     format_roles_table,
@@ -25,6 +27,7 @@ from .formatters import (
     to_json,
 )
 from .models import (
+    ChecklistItem,
     MaintenanceWindow,
     RepairTask,
     Role,
@@ -370,6 +373,129 @@ def task_rollback(ctx: click.Context, task_id: int, as_user: str) -> None:
         handle_error(e, output_format)
 
 
+@task.group()
+def checklist() -> None:
+    """Manage pre-execution checklists."""
+    pass
+
+
+@checklist.command("set")
+@click.argument("task_id", type=int)
+@click.option("--item", "items", multiple=True,
+              help="Checklist item in format 'name:required' (e.g., 'Verify backup:true')")
+@click.option("--json", "json_input", help="JSON array of checklist items")
+@click.option("--as-user", default="operator_user", help="Acting user")
+@click.pass_context
+def checklist_set(ctx: click.Context, task_id: int, items: tuple, json_input: Optional[str], as_user: str) -> None:
+    """Set checklist for a task (replaces existing)."""
+    output_format = ctx.obj["output_format"]
+    try:
+        service = get_service(ctx.obj["db_path"])
+
+        checklist_items: list[ChecklistItem] = []
+
+        if json_input:
+            import json
+            items_data = json.loads(json_input)
+            for item_data in items_data:
+                checklist_items.append(ChecklistItem(
+                    task_id=task_id,
+                    name=item_data.get("name", ""),
+                    required=item_data.get("required", True),
+                ))
+        else:
+            for item_str in items:
+                if ":" in item_str:
+                    name, req_str = item_str.rsplit(":", 1)
+                    required = req_str.lower() in ("true", "1", "yes", "required")
+                else:
+                    name = item_str
+                    required = True
+                checklist_items.append(ChecklistItem(
+                    task_id=task_id,
+                    name=name,
+                    required=required,
+                ))
+
+        if not checklist_items:
+            handle_error(ValidationError(
+                "No checklist items provided. Use --item or --json",
+                code="missing_checklist_items",
+            ), output_format)
+            return
+
+        result = service.set_checklist(task_id, checklist_items, as_user)
+        click.echo(success_response(
+            f"Checklist set for task {task_id}",
+            output_format,
+            task_id=result.task_id,
+            items_created=result.items_created,
+            items_updated=result.items_updated,
+        ))
+    except Exception as e:
+        handle_error(e, output_format)
+
+
+@checklist.command("view")
+@click.argument("task_id", type=int)
+@click.option("--as-user", default="operator_user", help="Acting user")
+@click.pass_context
+def checklist_view(ctx: click.Context, task_id: int, as_user: str) -> None:
+    """View checklist for a task."""
+    output_format = ctx.obj["output_format"]
+    try:
+        service = get_service(ctx.obj["db_path"])
+        items = service.get_checklist(task_id, as_user)
+        click.echo(format_output(items, output_format, format_checklist_table))
+    except Exception as e:
+        handle_error(e, output_format)
+
+
+@checklist.command("update")
+@click.argument("task_id", type=int)
+@click.argument("item_id", type=int)
+@click.option("--completed", type=click.Choice(["true", "false"]),
+              help="Mark item as completed or not")
+@click.option("--notes", help="Add notes to the checklist item")
+@click.option("--as-user", default="operator_user", help="Acting user")
+@click.pass_context
+def checklist_update(ctx: click.Context, task_id: int, item_id: int,
+                     completed: Optional[str], notes: Optional[str], as_user: str) -> None:
+    """Update a checklist item (mark complete, add notes)."""
+    output_format = ctx.obj["output_format"]
+    try:
+        if completed is None and notes is None:
+            handle_error(ValidationError(
+                "At least one of --completed or --notes must be specified",
+                code="missing_update_option",
+            ), output_format)
+            return
+
+        service = get_service(ctx.obj["db_path"])
+        completed_bool = (completed == "true") if completed else None
+        result = service.update_checklist_item(
+            task_id=task_id,
+            item_id=item_id,
+            actor=as_user,
+            completed=completed_bool,
+            notes=notes,
+        )
+        items = service.get_checklist(task_id, as_user)
+        updated_item = next((i for i in items if i.id == item_id), None)
+        click.echo(success_response(
+            f"Checklist item {item_id} updated for task {task_id}",
+            output_format,
+            task_id=result.task_id,
+            item_id=result.item_id,
+            old_value=result.old_value,
+            new_value=result.new_value,
+            updated_by=result.updated_by,
+            item=_checklist_to_dict(updated_item) if updated_item else None,
+        ))
+    except Exception as e:
+        handle_error(e, output_format)
+
+
 @cli.group()
 def audit() -> None:
     """View audit logs."""
@@ -527,9 +653,11 @@ def plan_export(ctx: click.Context, filepath: str, task_ids: tuple) -> None:
 @click.option("--dry-run", is_flag=True, help="Validate only, don't import")
 @click.option("--ignore-policy-conflict", is_flag=True,
               help="Proceed even if policy conflicts are detected")
+@click.option("--ignore-checklist-conflict", is_flag=True,
+              help="Proceed even if checklist conflicts are detected")
 @click.pass_context
 def plan_import(ctx: click.Context, filepath: str, as_user: str, dry_run: bool,
-                ignore_policy_conflict: bool) -> None:
+                ignore_policy_conflict: bool, ignore_checklist_conflict: bool) -> None:
     """Import repair plan from a JSON file."""
     output_format = ctx.obj["output_format"]
     try:
@@ -542,13 +670,22 @@ def plan_import(ctx: click.Context, filepath: str, as_user: str, dry_run: bool,
         errors = service.validate_import_plan(plan)
 
         policy_conflicts = [e for e in errors if e.code == "policy_conflict"]
-        other_errors = [e for e in errors if e.code != "policy_conflict"]
+        checklist_conflicts = [e for e in errors if e.code == "checklist_conflict"]
+        other_errors = [e for e in errors if e.code not in ("policy_conflict", "checklist_conflict")]
 
         if policy_conflicts and not ignore_policy_conflict and not dry_run:
             conflict_msg = "; ".join(e.message for e in policy_conflicts)
             handle_error(ValidationError(
                 f"Policy conflict detected. Use --ignore-policy-conflict to proceed. {conflict_msg}",
                 code="policy_conflict",
+            ), output_format)
+            return
+
+        if checklist_conflicts and not ignore_checklist_conflict and not dry_run:
+            conflict_msg = "; ".join(e.message for e in checklist_conflicts)
+            handle_error(ValidationError(
+                f"Checklist conflict detected. Use --ignore-checklist-conflict to proceed. {conflict_msg}",
+                code="checklist_conflict",
             ), output_format)
             return
 
@@ -562,8 +699,10 @@ def plan_import(ctx: click.Context, filepath: str, as_user: str, dry_run: bool,
 
         if dry_run:
             extra_info = {
+                "dry_run": True,
                 "windows_to_import": len(plan.get("windows", [])),
                 "tasks_to_import": len(plan.get("tasks", [])),
+                "checklist_items_to_import": len(plan.get("checklist_items", [])),
                 "audits_to_import": len(plan.get("audit_logs", [])),
             }
             if "policy" in plan:
@@ -571,6 +710,12 @@ def plan_import(ctx: click.Context, filepath: str, as_user: str, dry_run: bool,
             if policy_conflicts:
                 extra_info["policy_conflicts"] = [e.message for e in policy_conflicts]
                 extra_info["note"] = "Use --ignore-policy-conflict to import despite conflicts"
+            if checklist_conflicts:
+                extra_info["checklist_conflicts"] = [e.message for e in checklist_conflicts]
+                if "note" in extra_info:
+                    extra_info["note"] += ". Use --ignore-checklist-conflict to import despite checklist conflicts"
+                else:
+                    extra_info["note"] = "Use --ignore-checklist-conflict to import despite checklist conflicts"
             click.echo(success_response(
                 "Import validation passed (dry run)",
                 output_format,
@@ -581,6 +726,8 @@ def plan_import(ctx: click.Context, filepath: str, as_user: str, dry_run: bool,
         result = service.import_plan(plan, actor=as_user)
         if policy_conflicts:
             result["policy_conflicts_resolved"] = [e.message for e in policy_conflicts]
+        if checklist_conflicts:
+            result["checklist_conflicts_resolved"] = [e.message for e in checklist_conflicts]
         click.echo(success_response(
             "Plan imported successfully",
             output_format,
